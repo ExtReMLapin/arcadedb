@@ -252,8 +252,10 @@ function assignProperties(element) {
   for (let p in element.p) properties[p] = true;
 }
 
-function assignStyles(styles) {
-  if (styles === null) styles = [];
+function assignStyles(inputStyles) {
+  //if (styles === null) styles = [];
+  const styles = inputStyles || []
+
 
   for (let type in globalGraphSettings.types) {
     let element = getOrCreateStyleTypeAttrib(type, "element");
