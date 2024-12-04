@@ -14,8 +14,7 @@ function renderGraph() {
 
   globalTotalEdges = 0;
 
-  for (let i in globalResultset.vertices) {
-    let vertex = globalResultset.vertices[i];
+  for (const vertex of globalResultset.vertices) {
     assignVertexColor(vertex.t);
     assignProperties(vertex);
   }
@@ -26,8 +25,7 @@ function renderGraph() {
   }
 
   let reachedMax = false;
-  for (let i in globalResultset.vertices) {
-    let vertex = globalResultset.vertices[i];
+  for (const vertex of globalResultset.vertices) {
 
     let rid = vertex["r"];
     if (rid == null) continue;
@@ -489,8 +487,7 @@ function addNodeFromRecord(rid) {
   if (globalResultset.records == null) globalResultset.records = [];
 
   let vertex = null;
-  for (let i in globalResultset.vertices) {
-    let v = globalResultset.vertices[i];
+  for (const v of globalResultset.vertices) {
     if (v.r == rid) {
       vertex = v;
       break;
