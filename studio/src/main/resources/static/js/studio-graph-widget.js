@@ -258,22 +258,13 @@ function assignStyles(inputStyles) {
 
 
   for (let type in globalGraphSettings.types) {
-    let element = getOrCreateStyleTypeAttrib(type, "element");
-
-    let labelColor = getOrCreateStyleTypeAttrib(type, "labelColor");
-    if (labelColor === null) labelColor = "black";
-
-    let borderColor = getOrCreateStyleTypeAttrib(type, "borderColor");
-    if (borderColor === null) borderColor = "gray";
-
-    let shapeColor = getOrCreateStyleTypeAttrib(type, "shapeColor");
-    let icon = getOrCreateStyleTypeAttrib(type, "icon");
-
-    let shapeSize = getOrCreateStyleTypeAttrib(type, "shapeSize");
-    if (shapeSize === null) shapeSize = element === "v" ? "data(size)" : 1;
-
-    let labelSize = getOrCreateStyleTypeAttrib(type, "labelSize");
-    if (labelSize === null) labelSize = 1;
+    const element = getOrCreateStyleTypeAttrib(type, "element");
+    const labelColor = getOrCreateStyleTypeAttrib(type, "labelColor") || "black";
+    const borderColor = getOrCreateStyleTypeAttrib(type, "borderColor") || "gray";
+    const shapeColor = getOrCreateStyleTypeAttrib(type, "shapeColor");
+    const icon = getOrCreateStyleTypeAttrib(type, "icon");
+    const shapeSize = getOrCreateStyleTypeAttrib(type, "shapeSize") || (element === "v" ? "data(size)" : 1);
+    const labelSize = getOrCreateStyleTypeAttrib(type, "labelSize") || 1;
 
     let style = {
       selector: "." + type,
