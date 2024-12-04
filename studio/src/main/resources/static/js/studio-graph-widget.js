@@ -550,8 +550,8 @@ function displaySelectedNode() {
   if (globalSelected.length === 1) {
     data = globalSelected[0].data();
 
-    let summary = "<label class='form-label'>Node&nbsp</label><label class='form-label'><b>" + data.id + "</b></label>&nbsp;";
-    summary += "<label class='form-label'>Type&nbsp</label><label class='form-label'><b>" + data.type + "</b></label><br>";
+    let summary = `<label class='form-label'>Node&nbsp</label><label class='form-label'><b>${data.id}</b></label>&nbsp;`;
+    summary += `<label class='form-label'>Type&nbsp</label><label class='form-label'><b>${data.type}</b></label><br>`;
     summary += "<br><h5>Properties</h5>";
 
     $("#graphPropertiesType").html(summary);
