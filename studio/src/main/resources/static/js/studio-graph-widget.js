@@ -486,14 +486,7 @@ function addNodeFromRecord(rid) {
   if (globalResultset.edges == null) globalResultset.edges = [];
   if (globalResultset.records == null) globalResultset.records = [];
 
-  let vertex = null;
-  for (const v of globalResultset.vertices) {
-    if (v.r == rid) {
-      vertex = v;
-      break;
-    }
-  }
-
+  let vertex = globalResultset.vertices.find((v) => v.r == rid);
   if (vertex == null) {
     // LOAD FROM THE DATABASE
     jQuery
