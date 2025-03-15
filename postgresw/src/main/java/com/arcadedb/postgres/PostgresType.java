@@ -30,6 +30,8 @@ import java.util.stream.Collectors;
 
 import com.arcadedb.database.Binary;
 import com.arcadedb.database.DatabaseFactory;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 /**
  * Represents PostgreSQL data types and provides serialization/deserialization functionality.
@@ -54,6 +56,8 @@ public enum PostgresType {
   private static final Map<Integer, PostgresType> CODE_MAP = Arrays.stream(values())
       .collect(Collectors.toMap(type -> type.code, type -> type));
 
+  private static final ObjectMapper objectMapper = new ObjectMapper();
+
   public final int code;
   public final Class<?> cls;
   public final int size;
@@ -70,7 +74,6 @@ public enum PostgresType {
    * Parses an array string representation into an ArrayList.
    * Handles PostgreSQL array format like '{1,2,3}' or '{\"value1\",\"value2\"}'
    */
-  @SuppressWarnings("unchecked")
   private static <T> ArrayList<T> parseArrayFromString(String arrayStr, Function<String, T> elementParser) {
     if (arrayStr == null || arrayStr.isEmpty())
       return new ArrayList<>();
@@ -113,189 +116,86 @@ public enum PostgresType {
     return result;
   }
 
-  /**
-   * Serializes a value as text format into the provided Binary buffer.
-   *
-   * @param code       The PostgreSQL type code
-   * @param typeBuffer The buffer to write to
-   * @param value      The value to serialize
-   */
-  public void serializeAsText(final long code, final Binary typeBuffer, Object value) {
-    if (value == null) {
-      if (code == BOOLEAN.code) {
-        value = "0";
-      } else {
-        typeBuffer.putInt(-1);
-        return;
-      }
+/**
+ * Serializes a value as text format into the provided Binary buffer.
+ * Uses Jackson for JSON conversion of complex types.
+ *
+ * @param code       The PostgreSQL type code
+ * @param typeBuffer The buffer to write to
+ * @param value      The value to serialize
+ */
+public void serializeAsText(final long code, final Binary typeBuffer, Object value) {
+  if (value == null) {
+    if (code == BOOLEAN.code) {
+      value = "0";
+    } else {
+      typeBuffer.putInt(-1);
+      return;
     }
+  }
 
-    // Special case for arrays/collections
-    if (value instanceof Collection<?> collection) {
+  // Handle collections (including arrays)
+  if (value instanceof Collection<?>) {
     try {
-      // For PostgreSQL arrays, we MUST start with '{' and end with '}'
-      StringBuilder sb = new StringBuilder("{");
-      boolean first = true;
-
-      for (Object item : collection) {
-        if (!first) sb.append(",");
-        first = false;
-
-        if (item == null) {
-          sb.append("NULL");
-        }
-        else if (item instanceof String) {
-          // Strings need to be quoted in PostgreSQL array format
-          String escaped = ((String) item).replace("\"", "\\\"");
-          sb.append("\"").append(escaped).append("\"");
-        }
-        else if (item instanceof Number || item instanceof Boolean) {
-          // Numbers and booleans can be inserted directly
-          sb.append(item.toString());
-        }
-        else if (item instanceof Map) {
-          // For maps, we'll use JSON-like string representation
-          sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
-        }
-        else if (item instanceof Collection) {
-          // Recursively handle nested collections - critical for PostgreSQL arrays
-          sb.append(serializeCollectionToPostgresArray((Collection<?>) item));
-        }
-        else {
-          // Default for other types - stringify with quotes
-          sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
-        }
-      }
-
-      sb.append("}"); // Close the array
-
-      String postgresArrayStr = sb.toString();
-
-
-      final byte[] bytes = postgresArrayStr.getBytes(DatabaseFactory.getDefaultCharset());
+      // For PostgreSQL arrays, convert using the array format
+      String pgArray = convertToPgArray((Collection<?>) value);
+      byte[] bytes = pgArray.getBytes(DatabaseFactory.getDefaultCharset());
       typeBuffer.putInt(bytes.length);
       typeBuffer.putByteArray(bytes);
     } catch (Exception e) {
-      // Fallback - convert to plain string but ensure it starts with '{' and ends with '}'
-      String fallback = "{\"" + value.toString().replace("\"", "\\\"") + "\"}";
-      final byte[] bytes = fallback.getBytes(DatabaseFactory.getDefaultCharset());
+      // Fallback to simple string representation
+      String str = value.toString();
+      final byte[] bytes = str.getBytes(DatabaseFactory.getDefaultCharset());
       typeBuffer.putInt(bytes.length);
       typeBuffer.putByteArray(bytes);
     }
-      return;
-    }
-
-    // Standard handling for non-collection types
-    final byte[] str = value.toString().getBytes(DatabaseFactory.getDefaultCharset());
-    typeBuffer.putInt(str.length);
-    typeBuffer.putByteArray(str);
+    return;
   }
+
+  // Standard handling for non-collection types
+  final byte[] str = value.toString().getBytes(DatabaseFactory.getDefaultCharset());
+  typeBuffer.putInt(str.length);
+  typeBuffer.putByteArray(str);
+}
 
   /**
-   * Helper method for recursive handling of nested collections
+   * Converts a collection to a PostgreSQL array format using Jackson.
    */
-  private String serializeCollectionToPostgresArray(Collection<?> collection) {
-    StringBuilder sb = new StringBuilder("{");
-    boolean first = true;
-
-    for (Object item : collection) {
-      if (!first) sb.append(",");
-      first = false;
-
-      if (item == null) {
-        sb.append("NULL");
+  private String convertToPgArray(Collection<?> collection) {
+      if (collection == null || collection.isEmpty()) {
+          return "{}";
       }
-      else if (item instanceof String) {
-        String escaped = ((String) item).replace("\"", "\\\"");
-        sb.append("\"").append(escaped).append("\"");
+      
+      StringBuilder sb = new StringBuilder("{");
+      boolean first = true;
+      
+      for (Object item : collection) {
+          if (!first) sb.append(",");
+          first = false;
+          
+          if (item == null) {
+              sb.append("NULL");
+          } else if (item instanceof String) {
+              // For strings, we need PostgreSQL's quoted string format
+              sb.append("\"").append(((String) item).replace("\"", "\\\"")).append("\"");
+          } else if (item instanceof Number || item instanceof Boolean) {
+              sb.append(item);
+          } else {
+              try {
+                  // Complex objects get converted to JSON then escaped
+                  String json = objectMapper.writeValueAsString(item);
+                  sb.append("\"").append(json.replace("\"", "\\\"")).append("\"");
+              } catch (JsonProcessingException e) {
+                  // Fallback
+                  sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
+              }
+          }
       }
-      else if (item instanceof Number || item instanceof Boolean) {
-        sb.append(item.toString());
-      }
-      else if (item instanceof Collection) {
-        sb.append(serializeCollectionToPostgresArray((Collection<?>) item));
-      }
-      else {
-        sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
-      }
-    }
-
-    sb.append("}");
-    return sb.toString();
+      
+      sb.append("}");
+      return sb.toString();
   }
 
-
-  /**
-   * Serializes a Collection into a PostgreSQL array string format.
-   * Enhanced to better handle nested complex objects.
-   */
-  private String serializeArrayToString(Collection<?> collection) {
-    if (collection.isEmpty())
-      return "{}";
-
-    StringBuilder sb = new StringBuilder("{");
-    boolean first = true;
-    for (Object element : collection) {
-      if (!first) {
-        sb.append(",");
-      }
-      first = false;
-
-      if (element == null) {
-        sb.append("NULL");
-      } else if (element instanceof String) {
-        // Strings need to be quoted and escaped
-        sb.append("\"").append(((String) element).replace("\"", "\\\"")).append("\"");
-      } else if (element instanceof Map) {
-        // Convert maps to JSON-like strings
-        String jsonStr = mapToJsonString((Map<?, ?>) element);
-        sb.append("\"").append(jsonStr.replace("\"", "\\\"")).append("\"");
-      } else if (element instanceof Collection) {
-        // Handle nested collections by recursive call
-        sb.append(serializeArrayToString((Collection<?>) element));
-      } else {
-        sb.append(element.toString());
-      }
-    }
-    sb.append("}");
-    return sb.toString();
-  }
-
-  /**
-   * Converts a Map to a JSON-like string representation.
-   */
-  private String mapToJsonString(Map<?, ?> map) {
-    if (map == null || map.isEmpty())
-      return "{}";
-
-    StringBuilder sb = new StringBuilder("{");
-    boolean first = true;
-    for (Map.Entry<?, ?> entry : map.entrySet()) {
-      if (!first) {
-        sb.append(",");
-      }
-      first = false;
-
-      sb.append("\"").append(entry.getKey().toString().replace("\"", "\\\"")).append("\":");
-
-      Object value = entry.getValue();
-      if (value == null) {
-        sb.append("null");
-      } else if (value instanceof String) {
-        sb.append("\"").append(((String) value).replace("\"", "\\\"")).append("\"");
-      } else if (value instanceof Number || value instanceof Boolean) {
-        sb.append(value);
-      } else if (value instanceof Collection) {
-        sb.append(serializeArrayToString((Collection<?>) value));
-      } else if (value instanceof Map) {
-        sb.append(mapToJsonString((Map<?, ?>) value));
-      } else {
-        sb.append("\"").append(value.toString().replace("\"", "\\\"")).append("\"");
-      }
-    }
-    sb.append("}");
-    return sb.toString();
-  }
 
   /**
    * Determines the appropriate array type based on the element type.
