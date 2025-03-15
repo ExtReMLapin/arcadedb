@@ -419,67 +419,111 @@ public class PostgresNetworkExecutor extends Thread {
 
   private Map<String, PostgresType> getColumns(final List<Result> resultSet) {
     final Map<String, PostgresType> columns = new LinkedHashMap<>();
-
+  
     if (resultSet != null) {
+      System.out.println("PGSQL DEBUG - Analyzing result set with " + resultSet.size() + " rows");
+      
       boolean atLeastOneElement = false;
       for (final Result row : resultSet) {
         if (row.isElement())
           atLeastOneElement = true;
-
+  
         final Set<String> propertyNames = row.getPropertyNames();
+        System.out.println("PGSQL DEBUG - Row properties: " + propertyNames);
+        
         for (final String p : propertyNames) {
           final Object value = row.getProperty(p);
+          System.out.println("PGSQL DEBUG - Property " + p + " = " + value + 
+                            (value != null ? " (class: " + value.getClass().getName() + ")" : " (null)"));
+          
           if (value != null) {
             PostgresType valueType = columns.get(p);
-
+  
             if (valueType == null) {
               // FIND THE VALUE TYPE AND WRITE IT IN THE DATA DESCRIPTION
               final Class<?> valueClass = value.getClass();
-
+  
+              // Special handling for Map instances as JSON
+              if (value instanceof Map) {
+                System.out.println("PGSQL DEBUG - Property " + p + " detected as Map, using JSON type");
+                valueType = PostgresType.JSON;
+              }
               // Special handling for ArrayLists
-              if (value instanceof ArrayList<?> list) {
+              else if (value instanceof ArrayList<?> list) {
+                System.out.println("PGSQL DEBUG - Property " + p + " is ArrayList of size " + list.size());
+                
                 if (!list.isEmpty()) {
                   // Determine element type from the first non-null element
                   Object firstElement = list.stream().filter(Objects::nonNull).findFirst().orElse(null);
+                  System.out.println("PGSQL DEBUG - First element: " + firstElement + 
+                                    (firstElement != null ? " (class: " + firstElement.getClass().getName() + ")" : " (null)"));
+                  
                   if (firstElement != null) {
-                    valueType = PostgresType.getArrayTypeForElementType(firstElement.getClass());
+                    // If the first element is a Map or a complex ArcadeDB object, treat as JSON
+                    if (firstElement instanceof Map || 
+                        (firstElement.getClass().getName().startsWith("com.arcadedb") && 
+                         !(firstElement instanceof Number) && 
+                         !(firstElement instanceof String) && 
+                         !(firstElement instanceof Boolean))) {
+                      System.out.println("PGSQL DEBUG - ArrayList detected as containing complex objects, using JSON type");
+                      valueType = PostgresType.JSON;
+                    } else {
+                      System.out.println("PGSQL DEBUG - Using array type based on element type");
+                      valueType = PostgresType.getArrayTypeForElementType(firstElement.getClass());
+                    }
                   } else {
                     // Default to text array if all elements are null
+                    System.out.println("PGSQL DEBUG - All elements are null, using ARRAY_TEXT type");
                     valueType = PostgresType.ARRAY_TEXT;
                   }
                 } else {
                   // Default to text array for empty lists
+                  System.out.println("PGSQL DEBUG - Empty ArrayList, using ARRAY_TEXT type");
                   valueType = PostgresType.ARRAY_TEXT;
                 }
-              } else {
+              } 
+              // Handle other complex ArcadeDB objects that should be treated as JSON
+              else if (valueClass.getName().startsWith("com.arcadedb") && 
+                      !(value instanceof Number) && 
+                      !(value instanceof String) && 
+                      !(value instanceof Boolean)) {
+                System.out.println("PGSQL DEBUG - Property " + p + " detected as ArcadeDB complex object, using JSON type");
+                valueType = PostgresType.JSON;
+              }
+              else {
                 // Regular type matching
+                System.out.println("PGSQL DEBUG - Attempting to match property " + p + " to a PostgresType");
                 for (final PostgresType t : PostgresType.values()) {
                   if (t.cls.isAssignableFrom(valueClass) && !t.isArrayType()) {
                     valueType = t;
+                    System.out.println("PGSQL DEBUG - Matched to type: " + t.name());
                     break;
                   }
                 }
               }
-
-              if (valueType == null)
+  
+              if (valueType == null) {
+                System.out.println("PGSQL DEBUG - No type match found, using VARCHAR as default");
                 valueType = PostgresType.VARCHAR;
-
+              }
+  
+              System.out.println("PGSQL DEBUG - Final type for property " + p + ": " + valueType.name());
               columns.put(p, valueType);
             }
           }
         }
       }
-
+  
       if (atLeastOneElement) {
         columns.put("@rid", PostgresType.VARCHAR);
         columns.put("@type", PostgresType.VARCHAR);
         columns.put("@cat", PostgresType.CHAR);
       }
     }
-
+  
+    System.out.println("PGSQL DEBUG - Final column mappings: " + columns);
     return columns;
   }
-
   private void writeRowDescription(final Map<String, PostgresType> columns) {
     if (columns == null)
       return;
@@ -518,19 +562,22 @@ public class PostgresNetworkExecutor extends Thread {
   private void writeDataRows(final List<Result> resultSet, final Map<String, PostgresType> columns) throws IOException {
     if (resultSet.isEmpty())
       return;
-
-//    final ByteBuffer bufferData = ByteBuffer.allocate(128 * 1024).order(ByteOrder.BIG_ENDIAN);
-//    final ByteBuffer bufferValues = ByteBuffer.allocate(128 * 1024).order(ByteOrder.BIG_ENDIAN);
-
+  
+    System.out.println("PGSQL DEBUG - Writing data rows for " + resultSet.size() + " rows");
+    System.out.println("PGSQL DEBUG - Column types: " + columns);
+  
     final Binary bufferData = new Binary();
     final Binary bufferValues = new Binary();
-
+  
     for (final Result row : resultSet) {
       bufferValues.putShort((short) columns.size()); // Int16 The number of column values that follow (possibly zero).
-
+  
       for (final Map.Entry<String, PostgresType> entry : columns.entrySet()) {
         final String propertyName = entry.getKey();
-
+        final PostgresType columnType = entry.getValue();
+        
+        System.out.println("PGSQL DEBUG - Processing column: " + propertyName + " with type: " + columnType.name());
+  
         Object value = switch (propertyName) {
           case "@rid" -> row.isElement() ? row.getElement().get().getIdentity() : null;
           case "@type" -> row.isElement() ? row.getElement().get().getTypeName() : null;
@@ -568,10 +615,15 @@ public class PostgresNetworkExecutor extends Thread {
           }
           default -> row.getProperty(propertyName);
         };
-
+  
+        System.out.println("PGSQL DEBUG - Value for column " + propertyName + ": " + value + 
+                            (value != null ? " (class: " + value.getClass().getName() + ")" : " (null)"));
+        
+        // Before serialization
+        System.out.println("PGSQL DEBUG - Serializing value with type: " + columnType.name() + " and code: " + columnType.code);
+        
         entry.getValue().serializeAsText(entry.getValue().code, bufferValues, value);
       }
-
       bufferValues.flip();
       bufferData.putByte((byte) 'D');
       bufferData.putInt(4 + bufferValues.getByteBuffer().limit());

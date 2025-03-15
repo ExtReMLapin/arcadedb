@@ -27,6 +27,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.logging.Level;
+
+import com.arcadedb.query.sql.executor.Result;
+import com.arcadedb.log.LogManager;
 
 import com.arcadedb.database.Binary;
 import com.arcadedb.database.DatabaseFactory;
@@ -45,6 +49,8 @@ public enum PostgresType {
   BOOLEAN(16, Boolean.class, 1, value -> value.equalsIgnoreCase("true")),
   DATE(1082, Date.class, 8, value -> new Date(Long.parseLong(value))),
   VARCHAR(1043, String.class, -1, value -> value),
+  // Adding JSON type with PostgreSQL's JSONB type code
+  JSON(3802, Map.class, -1, value -> value), // Using JSONB type code
   // Adding array types with PostgreSQL array type codes
   ARRAY_INT(1007, ArrayList.class, -1, value -> parseArrayFromString(value, Integer::parseInt)),
   ARRAY_LONG(1016, ArrayList.class, -1, value -> parseArrayFromString(value, Long::parseLong)),
@@ -114,83 +120,273 @@ public enum PostgresType {
     return result;
   }
 
-  /**
-   * Serializes a value as text format into the provided Binary buffer.
-   * Uses JSONObject for JSON conversion of complex types.
-   *
-   * @param code       The PostgreSQL type code
-   * @param typeBuffer The buffer to write to
-   * @param value      The value to serialize
-   */
-  public void serializeAsText(final long code, final Binary typeBuffer, Object value) {
-    if (value == null) {
-      if (code == BOOLEAN.code) {
-        value = "0";
+/**
+ * Helper method to safely serialize an object to JSON
+ * Works around reflection limitations by using toString for problematic types
+ */
+private String serializeToJson(Object value) {
+  try {
+      // For collections of ArcadeDB objects, we need special handling
+      if (value instanceof Collection<?> collection) {
+          StringBuilder jsonArray = new StringBuilder("[");
+          boolean first = true;
+          
+          for (Object item : collection) {
+              if (!first) jsonArray.append(",");
+              first = false;
+              
+              if (item == null) {
+                  jsonArray.append("null");
+              } else if (item instanceof Map) {
+                  // For Map objects, use standard JSON conversion
+                  jsonArray.append(JSONFactory.INSTANCE.getGson().toJson(item));
+              } else if (item.getClass().getName().startsWith("com.arcadedb")) {
+                  // For ArcadeDB objects, extract properties directly
+                  if (item instanceof Result result) {
+                      // Handle Result objects by extracting their properties
+                      jsonArray.append("{");
+                      boolean firstProp = true;
+                      for (String propName : result.getPropertyNames()) {
+                          if (!firstProp) jsonArray.append(",");
+                          firstProp = false;
+                          
+                          jsonArray.append("\"").append(propName).append("\":");
+                          Object propValue = result.getProperty(propName);
+                          
+                          if (propValue == null) {
+                              jsonArray.append("null");
+                          } else if (propValue instanceof String) {
+                              jsonArray.append("\"").append(escapeJsonString((String)propValue)).append("\"");
+                          } else if (propValue instanceof Number || propValue instanceof Boolean) {
+                              jsonArray.append(propValue);
+                          } else {
+                              // For other types, use toString in quotes
+                              jsonArray.append("\"").append(escapeJsonString(propValue.toString())).append("\"");
+                          }
+                      }
+                      jsonArray.append("}");
+                  } else {
+                      // For unknown ArcadeDB objects, use toString in quotes
+                      jsonArray.append("\"").append(escapeJsonString(item.toString())).append("\"");
+                  }
+              } else if (item instanceof String) {
+                  jsonArray.append("\"").append(escapeJsonString((String)item)).append("\"");
+              } else if (item instanceof Number || item instanceof Boolean) {
+                  jsonArray.append(item);
+              } else {
+                  // For unknown types, use toString in quotes
+                  jsonArray.append("\"").append(escapeJsonString(item.toString())).append("\"");
+              }
+          }
+          
+          jsonArray.append("]");
+          return jsonArray.toString();
+      } 
+      
+      // For Maps and simple types, use standard Gson
+      return JSONFactory.INSTANCE.getGson().toJson(value);
+  } catch (Exception e) {
+      LogManager.instance().log(this, Level.WARNING, "Error during JSON serialization: %s", e, e.getMessage());
+      
+      // Fallback to toString with proper JSON wrapping
+      if (value instanceof Collection) {
+          return "[" + value.toString() + "]";
+      } else if (value instanceof Map) {
+          return "{" + value.toString() + "}";
       } else {
-        typeBuffer.putInt(-1);
-        return;
+          return "\"" + escapeJsonString(value.toString()) + "\"";
       }
-    }
-
-    // Handle collections (including arrays)
-    if (value instanceof Collection<?>) {
-      try {
-        // For PostgreSQL arrays, convert using the array format
-        String pgArray = convertToPgArray((Collection<?>) value);
-        byte[] bytes = pgArray.getBytes(DatabaseFactory.getDefaultCharset());
-        typeBuffer.putInt(bytes.length);
-        typeBuffer.putByteArray(bytes);
-      } catch (Exception e) {
-        // Fallback to simple string representation
-        String str = value.toString();
-        final byte[] bytes = str.getBytes(DatabaseFactory.getDefaultCharset());
-        typeBuffer.putInt(bytes.length);
-        typeBuffer.putByteArray(bytes);
-      }
-      return;
-    }
-
-    // Standard handling for non-collection types
-    final byte[] str = value.toString().getBytes(DatabaseFactory.getDefaultCharset());
-    typeBuffer.putInt(str.length);
-    typeBuffer.putByteArray(str);
   }
+}
+
+/**
+* Helper method to escape strings for JSON
+*/
+private String escapeJsonString(String input) {
+  if (input == null) return "";
+  
+  return input
+      .replace("\\", "\\\\")
+      .replace("\"", "\\\"")
+      .replace("\b", "\\b")
+      .replace("\f", "\\f")
+      .replace("\n", "\\n")
+      .replace("\r", "\\r")
+      .replace("\t", "\\t");
+}
+
+/**
+ * Serializes a value as text format into the provided Binary buffer.
+ * Uses custom JSON serialization for complex types.
+ *
+ * @param code       The PostgreSQL type code
+ * @param typeBuffer The buffer to write to
+ * @param value      The value to serialize
+ */
+public void serializeAsText(final long code, final Binary typeBuffer, Object value) {
+  try {
+      if (value == null) {
+          if (code == BOOLEAN.code) {
+              value = "0";
+          } else {
+              typeBuffer.putInt(-1);
+              return;
+          }
+      }
+
+      // Force JSON serialization if this is explicitly a JSON type
+      if (this == JSON) {
+          String jsonStr = serializeToJson(value);
+          final byte[] bytes = jsonStr.getBytes(DatabaseFactory.getDefaultCharset());
+          typeBuffer.putInt(bytes.length);
+          typeBuffer.putByteArray(bytes);
+          return;
+      }
+
+      // Handle Map objects as JSON
+      if (value instanceof Map) {
+          String jsonStr = serializeToJson(value);
+          final byte[] bytes = jsonStr.getBytes(DatabaseFactory.getDefaultCharset());
+          typeBuffer.putInt(bytes.length);
+          typeBuffer.putByteArray(bytes);
+          return;
+      }
+
+      // Handle collections that might contain complex objects
+      if (value instanceof Collection<?>) {
+          Collection<?> collection = (Collection<?>) value;
+          
+          if (!collection.isEmpty()) {
+              Object firstElement = collection.iterator().next();
+              
+              // Check if collection contains complex objects that need JSON serialization
+              if (firstElement instanceof Map || 
+                  (firstElement != null && firstElement.getClass().getName().startsWith("com.arcadedb") &&
+                  !(firstElement instanceof Number) && 
+                  !(firstElement instanceof String) && 
+                  !(firstElement instanceof Boolean))) {
+                  
+                  String jsonArray = serializeToJson(collection);
+                  byte[] bytes = jsonArray.getBytes(DatabaseFactory.getDefaultCharset());
+                  typeBuffer.putInt(bytes.length);
+                  typeBuffer.putByteArray(bytes);
+                  return;
+              }
+          }
+          
+          // For simple collections, use the PostgreSQL array format
+          String pgArray = convertToPgArray((Collection<?>) value);
+          byte[] bytes = pgArray.getBytes(DatabaseFactory.getDefaultCharset());
+          typeBuffer.putInt(bytes.length);
+          typeBuffer.putByteArray(bytes);
+          return;
+      }
+
+      // Handle ArcadeDB domain objects
+      if (value != null && value.getClass().getName().startsWith("com.arcadedb") &&
+          !(value instanceof Number) && 
+          !(value instanceof String) && 
+          !(value instanceof Boolean)) {
+          
+          // For Result objects, use our custom serialization
+          if (value instanceof Result result) {
+              StringBuilder jsonObj = new StringBuilder("{");
+              boolean firstProp = true;
+              
+              for (String propName : result.getPropertyNames()) {
+                  if (!firstProp) jsonObj.append(",");
+                  firstProp = false;
+                  
+                  jsonObj.append("\"").append(propName).append("\":");
+                  Object propValue = result.getProperty(propName);
+                  
+                  if (propValue == null) {
+                      jsonObj.append("null");
+                  } else if (propValue instanceof String) {
+                      jsonObj.append("\"").append(escapeJsonString((String)propValue)).append("\"");
+                  } else if (propValue instanceof Number || propValue instanceof Boolean) {
+                      jsonObj.append(propValue);
+                  } else {
+                      // Use our custom serialization method for complex values
+                      jsonObj.append(serializeToJson(propValue));
+                  }
+              }
+              
+              jsonObj.append("}");
+              byte[] bytes = jsonObj.toString().getBytes(DatabaseFactory.getDefaultCharset());
+              typeBuffer.putInt(bytes.length);
+              typeBuffer.putByteArray(bytes);
+              return;
+          } else {
+              // For other ArcadeDB objects, try generic JSON serialization
+              try {
+                  String jsonStr = serializeToJson(value);
+                  final byte[] bytes = jsonStr.getBytes(DatabaseFactory.getDefaultCharset());
+                  typeBuffer.putInt(bytes.length);
+                  typeBuffer.putByteArray(bytes);
+                  return;
+              } catch (Exception e) {
+                  // Fall through to standard string serialization
+              }
+          }
+      }
+
+      // Standard handling for primitive types
+      final byte[] str = value.toString().getBytes(DatabaseFactory.getDefaultCharset());
+      typeBuffer.putInt(str.length);
+      typeBuffer.putByteArray(str);
+  } catch (Exception e) {
+      LogManager.instance().log(this, Level.WARNING, "Error serializing value: %s", e, e.getMessage());
+      
+      // Fallback to string representation
+      final byte[] str = value.toString().getBytes(DatabaseFactory.getDefaultCharset());
+      typeBuffer.putInt(str.length);
+      typeBuffer.putByteArray(str);
+  }
+}
+
 
   /**
    * Converts a collection to a PostgreSQL array format using JSONObject.
    */
   private String convertToPgArray(Collection<?> collection) {
     if (collection == null || collection.isEmpty())
-      return "{}";
+        return "{}";
+    
+    System.out.println("PGSQL DEBUG - Converting collection to PostgreSQL array format");
     StringBuilder sb = new StringBuilder("{");
     boolean first = true;
     for (Object item : collection) {
-      if (!first) {
-        sb.append(",");
-      }
-      first = false;
-
-      if (item == null) {
-        sb.append("NULL");
-      } else if (item instanceof String) {
-        // For strings, we need PostgreSQL's quoted string format
-        sb.append("\"").append(((String) item).replace("\"", "\\\"")).append("\"");
-      } else if (item instanceof Number || item instanceof Boolean) {
-        sb.append(item);
-      } else {
-        try {
-          // Complex objects get converted to JSON using JSONFactory
-          String json = JSONFactory.INSTANCE.getGson().toJson(item);
-          sb.append("\"").append(json.replace("\"", "\\\"")).append("\"");
-        } catch (Exception e) {
-          // Fallback
-          sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
+        if (!first) {
+            sb.append(",");
         }
-      }
+        first = false;
+
+        if (item == null) {
+            sb.append("NULL");
+        } else if (item instanceof String) {
+            // For strings, we need PostgreSQL's quoted string format
+            sb.append("\"").append(((String) item).replace("\"", "\\\"")).append("\"");
+        } else if (item instanceof Number || item instanceof Boolean) {
+            sb.append(item);
+        } else {
+            try {
+                // Complex objects get converted to JSON using JSONFactory
+                String json = JSONFactory.INSTANCE.getGson().toJson(item);
+                System.out.println("PGSQL DEBUG - Complex item in array as JSON: " + json);
+                sb.append("\"").append(json.replace("\"", "\\\"")).append("\"");
+            } catch (Exception e) {
+                System.out.println("PGSQL DEBUG - Exception during complex item serialization: " + e.getMessage());
+                e.printStackTrace();
+                // Fallback
+                sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
+            }
+        }
     }
     sb.append("}");
+    System.out.println("PGSQL DEBUG - Final PostgreSQL array: " + sb.toString());
     return sb.toString();
-  }
+}
 
   /**
    * Determines the appropriate array type based on the element type.
@@ -232,6 +428,15 @@ public enum PostgresType {
       return str;
     }
 
+    if (code == JSON.code) {
+      // Parse JSON string into object
+      try {
+        return JSONFactory.INSTANCE.getGson().fromJson(str, Object.class);
+      } catch (Exception e) {
+        throw new PostgresProtocolException("Error parsing JSON", e);
+      }
+    }
+
     PostgresType type = CODE_MAP.get((int) code);
     if (type == null) {
       throw new PostgresProtocolException("Type with code " + code + " not supported for deserializing");
@@ -263,10 +468,12 @@ public enum PostgresType {
       case DATE -> new Date(buffer.getLong());
       case CHAR -> buffer.getChar();
       case BOOLEAN -> buffer.get() == 1;
+      case JSON -> {
+        // Binary JSON deserialization
+        throw new PostgresProtocolException("Binary deserialization for JSON not yet implemented");
+      }
       case ARRAY_INT, ARRAY_LONG, ARRAY_DOUBLE, ARRAY_TEXT, ARRAY_BOOLEAN -> {
         // For binary format, would need to implement proper array binary deserialization
-        // This is a simplified placeholder - proper implementation would need to handle
-        // array dimensions and element deserialization according to PostgreSQL protocol
         throw new PostgresProtocolException("Binary deserialization for arrays not yet implemented");
       }
     };
