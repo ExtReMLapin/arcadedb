@@ -130,22 +130,104 @@ public enum PostgresType {
       }
     }
 
-    // Handle array serialization
+    // Special case for arrays/collections
     if (value instanceof Collection<?> collection) {
-      String arrayStr = serializeArrayToString(collection);
-      final byte[] str = arrayStr.getBytes(DatabaseFactory.getDefaultCharset());
-      typeBuffer.putInt(str.length);
-      typeBuffer.putByteArray(str);
+    try {
+      // For PostgreSQL arrays, we MUST start with '{' and end with '}'
+      StringBuilder sb = new StringBuilder("{");
+      boolean first = true;
+
+      for (Object item : collection) {
+        if (!first) sb.append(",");
+        first = false;
+
+        if (item == null) {
+          sb.append("NULL");
+        }
+        else if (item instanceof String) {
+          // Strings need to be quoted in PostgreSQL array format
+          String escaped = ((String) item).replace("\"", "\\\"");
+          sb.append("\"").append(escaped).append("\"");
+        }
+        else if (item instanceof Number || item instanceof Boolean) {
+          // Numbers and booleans can be inserted directly
+          sb.append(item.toString());
+        }
+        else if (item instanceof Map) {
+          // For maps, we'll use JSON-like string representation
+          sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
+        }
+        else if (item instanceof Collection) {
+          // Recursively handle nested collections - critical for PostgreSQL arrays
+          sb.append(serializeCollectionToPostgresArray((Collection<?>) item));
+        }
+        else {
+          // Default for other types - stringify with quotes
+          sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
+        }
+      }
+
+      sb.append("}"); // Close the array
+
+      String postgresArrayStr = sb.toString();
+
+
+      final byte[] bytes = postgresArrayStr.getBytes(DatabaseFactory.getDefaultCharset());
+      typeBuffer.putInt(bytes.length);
+      typeBuffer.putByteArray(bytes);
+    } catch (Exception e) {
+      // Fallback - convert to plain string but ensure it starts with '{' and ends with '}'
+      String fallback = "{\"" + value.toString().replace("\"", "\\\"") + "\"}";
+      final byte[] bytes = fallback.getBytes(DatabaseFactory.getDefaultCharset());
+      typeBuffer.putInt(bytes.length);
+      typeBuffer.putByteArray(bytes);
+    }
       return;
     }
 
+    // Standard handling for non-collection types
     final byte[] str = value.toString().getBytes(DatabaseFactory.getDefaultCharset());
     typeBuffer.putInt(str.length);
     typeBuffer.putByteArray(str);
   }
 
   /**
+   * Helper method for recursive handling of nested collections
+   */
+  private String serializeCollectionToPostgresArray(Collection<?> collection) {
+    StringBuilder sb = new StringBuilder("{");
+    boolean first = true;
+
+    for (Object item : collection) {
+      if (!first) sb.append(",");
+      first = false;
+
+      if (item == null) {
+        sb.append("NULL");
+      }
+      else if (item instanceof String) {
+        String escaped = ((String) item).replace("\"", "\\\"");
+        sb.append("\"").append(escaped).append("\"");
+      }
+      else if (item instanceof Number || item instanceof Boolean) {
+        sb.append(item.toString());
+      }
+      else if (item instanceof Collection) {
+        sb.append(serializeCollectionToPostgresArray((Collection<?>) item));
+      }
+      else {
+        sb.append("\"").append(item.toString().replace("\"", "\\\"")).append("\"");
+      }
+    }
+
+    sb.append("}");
+    return sb.toString();
+  }
+
+
+  /**
    * Serializes a Collection into a PostgreSQL array string format.
+   * Enhanced to better handle nested complex objects.
    */
   private String serializeArrayToString(Collection<?> collection) {
     if (collection.isEmpty())
@@ -159,11 +241,56 @@ public enum PostgresType {
       }
       first = false;
 
-      if (element instanceof String) {
-        // Strings need to be quoted
+      if (element == null) {
+        sb.append("NULL");
+      } else if (element instanceof String) {
+        // Strings need to be quoted and escaped
         sb.append("\"").append(((String) element).replace("\"", "\\\"")).append("\"");
+      } else if (element instanceof Map) {
+        // Convert maps to JSON-like strings
+        String jsonStr = mapToJsonString((Map<?, ?>) element);
+        sb.append("\"").append(jsonStr.replace("\"", "\\\"")).append("\"");
+      } else if (element instanceof Collection) {
+        // Handle nested collections by recursive call
+        sb.append(serializeArrayToString((Collection<?>) element));
       } else {
-        sb.append(element == null ? "NULL" : element.toString());
+        sb.append(element.toString());
+      }
+    }
+    sb.append("}");
+    return sb.toString();
+  }
+
+  /**
+   * Converts a Map to a JSON-like string representation.
+   */
+  private String mapToJsonString(Map<?, ?> map) {
+    if (map == null || map.isEmpty())
+      return "{}";
+
+    StringBuilder sb = new StringBuilder("{");
+    boolean first = true;
+    for (Map.Entry<?, ?> entry : map.entrySet()) {
+      if (!first) {
+        sb.append(",");
+      }
+      first = false;
+
+      sb.append("\"").append(entry.getKey().toString().replace("\"", "\\\"")).append("\":");
+
+      Object value = entry.getValue();
+      if (value == null) {
+        sb.append("null");
+      } else if (value instanceof String) {
+        sb.append("\"").append(((String) value).replace("\"", "\\\"")).append("\"");
+      } else if (value instanceof Number || value instanceof Boolean) {
+        sb.append(value);
+      } else if (value instanceof Collection) {
+        sb.append(serializeArrayToString((Collection<?>) value));
+      } else if (value instanceof Map) {
+        sb.append(mapToJsonString((Map<?, ?>) value));
+      } else {
+        sb.append("\"").append(value.toString().replace("\"", "\\\"")).append("\"");
       }
     }
     sb.append("}");
