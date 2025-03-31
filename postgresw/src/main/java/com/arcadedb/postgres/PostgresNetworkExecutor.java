@@ -422,36 +422,48 @@ public class PostgresNetworkExecutor extends Thread {
     final Map<String, PostgresType> columns = new LinkedHashMap<>();
 
     boolean atLeastOneElement = false;
+
+    // First, collect all column names from all rows
+    Set<String> allPropertyNames = new HashSet<>();
     for (final Result row : resultSet) {
       if (row.isElement())
         atLeastOneElement = true;
 
-      final Set<String> propertyNames = row.getPropertyNames();
-      for (final String p : propertyNames) {
+      allPropertyNames.addAll(row.getPropertyNames());
+    }
+
+    // Add schema properties for existing columns even if they have no values
+    if (!resultSet.isEmpty() && database != null) {
+      try {
+        DocumentType type = database.getSchema().getType(resultSet.get(0).getProperty("@type"));
+        if (type != null) {
+          for (String propName : type.getPropertyNames())
+            allPropertyNames.add(propName);
+        }
+      } catch (Exception ignored) {
+        // Continue with what we have if schema lookup fails
+      }
+    }
+
+    // Now process all the properties
+    for (final String p : allPropertyNames) {
+      // First try to determine type from non-null values
+      PostgresType currentType = null;
+      for (final Result row : resultSet) {
         final Object value = row.getProperty(p);
-
         if (value != null) {
-          PostgresType currentType = columns.get(p);
-
-          final Class<?> valueClass = value.getClass();
-          if (currentType == null || currentType.cls != valueClass) {
-
-            PostgresType newType = PostgresType.getTypeForValue(value);
-            // assign new type if it id better than the current one: better means more specific than VARCHAR
-            if (newType != null &&
-                newType != currentType
-            ) {
-              currentType = newType;
-            }
-            // in the end, if currentType is null, assign VARCHAR
-            if (currentType == null)
-              currentType = PostgresType.VARCHAR;
-
-            columns.put(p, currentType);
-
+          PostgresType newType = PostgresType.getTypeForValue(value);
+          if (newType != null && (currentType == null || newType != currentType)) {
+            currentType = newType;
           }
         }
       }
+
+      // If we couldn't determine a type, use VARCHAR as default
+      if (currentType == null)
+        currentType = PostgresType.VARCHAR;
+
+      columns.put(p, currentType);
     }
 
     if (atLeastOneElement) {
