@@ -239,29 +239,40 @@ public class ForeachStep extends AbstractExecutionStep {
   }
 
   private void executeCreate(final CreateClause createClause, final Result loopContext, final CommandContext context) {
-    // Delegate to CreateStep logic
+    // Delegate to CreateStep logic with proper execution chain
     final CreateStep createStep = new CreateStep(createClause, context);
-    // Create a mini result set with just the loop context
-    final ResultSet miniResultSet = new ResultSet() {
-      private boolean consumed = false;
 
+    // Set up a previous step that provides the loop context
+    createStep.setPrevious(new AbstractExecutionStep(context) {
       @Override
-      public boolean hasNext() {
-        return !consumed;
+      public ResultSet syncPull(final CommandContext ctx, final int nRecords) {
+        return new ResultSet() {
+          private boolean consumed = false;
+
+          @Override
+          public boolean hasNext() {
+            return !consumed;
+          }
+
+          @Override
+          public Result next() {
+            if (consumed)
+              throw new NoSuchElementException();
+            consumed = true;
+            return loopContext;
+          }
+
+          @Override
+          public void close() {
+          }
+        };
       }
 
       @Override
-      public Result next() {
-        if (consumed)
-          throw new NoSuchElementException();
-        consumed = true;
-        return loopContext;
+      public String prettyPrint(final int depth, final int indent) {
+        return "";
       }
-
-      @Override
-      public void close() {
-      }
-    };
+    });
 
     // Execute the create step
     final ResultSet createResults = createStep.syncPull(context, 1);
