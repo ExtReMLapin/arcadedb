@@ -28,6 +28,7 @@ import com.arcadedb.query.opencypher.executor.steps.DeleteStep;
 import com.arcadedb.query.opencypher.executor.steps.ExpandPathStep;
 import com.arcadedb.query.opencypher.executor.steps.FilterPropertiesStep;
 import com.arcadedb.query.opencypher.executor.steps.FinalProjectionStep;
+import com.arcadedb.query.opencypher.executor.steps.ForeachStep;
 import com.arcadedb.query.opencypher.executor.steps.GroupByAggregationStep;
 import com.arcadedb.query.opencypher.executor.steps.LimitStep;
 import com.arcadedb.query.opencypher.executor.steps.MatchNodeStep;
@@ -713,6 +714,16 @@ public class CypherExecutionPlan {
             callStep.setPrevious(currentStep);
           }
           currentStep = callStep;
+          break;
+
+        case FOREACH:
+          final ForeachClause foreachClause = entry.getTypedClause();
+          final ForeachStep foreachStep =
+              new ForeachStep(foreachClause, context, functionFactory);
+          if (currentStep != null) {
+            foreachStep.setPrevious(currentStep);
+          }
+          currentStep = foreachStep;
           break;
       }
     }

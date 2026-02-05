@@ -128,6 +128,7 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     final List<WithClause> withClauses = new ArrayList<>();
     final List<CallClause> callClauses = new ArrayList<>();
     final List<RemoveClause> removeClauses = new ArrayList<>();
+    final List<ForeachClause> foreachClauses = new ArrayList<>();
     final List<ClauseEntry> clausesInOrder = new ArrayList<>();
     WhereClause whereClause = null;
     ReturnClause returnClause = null;
@@ -199,6 +200,10 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
         final RemoveClause remove = visitRemoveClause(clauseCtx.removeClause());
         removeClauses.add(remove);
         clausesInOrder.add(new ClauseEntry(ClauseEntry.ClauseType.REMOVE, remove, clauseOrder++));
+      } else if (clauseCtx.foreachClause() != null) {
+        final ForeachClause foreach = visitForeachClause(clauseCtx.foreachClause());
+        foreachClauses.add(foreach);
+        clausesInOrder.add(new ClauseEntry(ClauseEntry.ClauseType.FOREACH, foreach, clauseOrder++));
       }
     }
 
@@ -230,6 +235,7 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
         withClauses,
         callClauses,
         removeClauses,
+        foreachClauses,
         clausesInOrder,
         hasCreate,
         hasMerge,
@@ -441,6 +447,39 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     final Expression listExpression = expressionBuilder.parseExpression(ctx.expression());
     final String variable = stripBackticks(ctx.variable().getText());
     return new UnwindClause(listExpression, variable);
+  }
+
+  @Override
+  public ForeachClause visitForeachClause(final Cypher25Parser.ForeachClauseContext ctx) {
+    // Grammar: FOREACH LPAREN variable IN expression BAR clause+ RPAREN
+    final String variable = stripBackticks(ctx.variable().getText());
+    final Expression listExpression = expressionBuilder.parseExpression(ctx.expression());
+
+    // Parse nested clauses
+    final List<ClauseEntry> nestedClauses = new ArrayList<>();
+    int clauseOrder = 0;
+    for (final Cypher25Parser.ClauseContext clauseCtx : ctx.clause()) {
+      // Only updating clauses are allowed inside FOREACH
+      if (clauseCtx.createClause() != null) {
+        final CreateClause create = visitCreateClause(clauseCtx.createClause());
+        nestedClauses.add(new ClauseEntry(ClauseEntry.ClauseType.CREATE, create, clauseOrder++));
+      } else if (clauseCtx.setClause() != null) {
+        final SetClause set = visitSetClause(clauseCtx.setClause());
+        nestedClauses.add(new ClauseEntry(ClauseEntry.ClauseType.SET, set, clauseOrder++));
+      } else if (clauseCtx.deleteClause() != null) {
+        final DeleteClause delete = visitDeleteClause(clauseCtx.deleteClause());
+        nestedClauses.add(new ClauseEntry(ClauseEntry.ClauseType.DELETE, delete, clauseOrder++));
+      } else if (clauseCtx.removeClause() != null) {
+        final RemoveClause remove = visitRemoveClause(clauseCtx.removeClause());
+        nestedClauses.add(new ClauseEntry(ClauseEntry.ClauseType.REMOVE, remove, clauseOrder++));
+      } else if (clauseCtx.mergeClause() != null) {
+        final MergeClause merge = visitMergeClause(clauseCtx.mergeClause());
+        nestedClauses.add(new ClauseEntry(ClauseEntry.ClauseType.MERGE, merge, clauseOrder++));
+      }
+      // Note: Reading clauses (MATCH, RETURN, WITH) are not allowed in FOREACH
+    }
+
+    return new ForeachClause(variable, listExpression, nestedClauses);
   }
 
   @Override

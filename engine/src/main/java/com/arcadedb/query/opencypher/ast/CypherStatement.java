@@ -167,4 +167,14 @@ public interface CypherStatement {
   default List<RemoveClause> getRemoveClauses() {
     return List.of();
   }
+
+  /**
+   * Returns the FOREACH clauses if present.
+   * FOREACH clauses iterate over lists and execute updating clauses for each element.
+   *
+   * @return list of FOREACH clauses (may be empty)
+   */
+  default List<ForeachClause> getForeachClauses() {
+    return List.of();
+  }
 }

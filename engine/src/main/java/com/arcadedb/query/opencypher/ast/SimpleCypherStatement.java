@@ -42,6 +42,7 @@ public class SimpleCypherStatement implements CypherStatement {
   private final List<WithClause> withClauses;
   private final List<CallClause> callClauses;
   private final List<RemoveClause> removeClauses;
+  private final List<ForeachClause> foreachClauses;
   private final List<ClauseEntry> clausesInOrder;
   private final boolean hasCreate;
   private final boolean hasMerge;
@@ -51,14 +52,14 @@ public class SimpleCypherStatement implements CypherStatement {
   public SimpleCypherStatement(final String originalQuery, final List<MatchClause> matchClauses,
       final WhereClause whereClause, final ReturnClause returnClause, final boolean hasCreate, final boolean hasMerge,
       final boolean hasDelete) {
-    this(originalQuery, matchClauses, whereClause, returnClause, null, null, null, null, null, null, null, null, null, null,
+    this(originalQuery, matchClauses, whereClause, returnClause, null, null, null, null, null, null, null, null, null, null, null,
         hasCreate, hasMerge, hasDelete);
   }
 
   public SimpleCypherStatement(final String originalQuery, final List<MatchClause> matchClauses,
       final WhereClause whereClause, final ReturnClause returnClause, final OrderByClause orderByClause,
       final Integer skip, final Integer limit, final boolean hasCreate, final boolean hasMerge, final boolean hasDelete) {
-    this(originalQuery, matchClauses, whereClause, returnClause, orderByClause, skip, limit, null, null, null, null, null, null, null,
+    this(originalQuery, matchClauses, whereClause, returnClause, orderByClause, skip, limit, null, null, null, null, null, null, null, null,
         hasCreate, hasMerge, hasDelete);
   }
 
@@ -69,7 +70,7 @@ public class SimpleCypherStatement implements CypherStatement {
       final List<WithClause> withClauses,
       final boolean hasCreate, final boolean hasMerge, final boolean hasDelete) {
     this(originalQuery, matchClauses, whereClause, returnClause, orderByClause, skip, limit, createClause, setClause,
-        deleteClause, mergeClause, unwindClauses, withClauses, null, hasCreate, hasMerge, hasDelete);
+        deleteClause, mergeClause, unwindClauses, withClauses, null, null, hasCreate, hasMerge, hasDelete);
   }
 
   public SimpleCypherStatement(final String originalQuery, final List<MatchClause> matchClauses,
@@ -79,7 +80,7 @@ public class SimpleCypherStatement implements CypherStatement {
       final List<WithClause> withClauses, final List<ClauseEntry> clausesInOrder,
       final boolean hasCreate, final boolean hasMerge, final boolean hasDelete) {
     this(originalQuery, matchClauses, whereClause, returnClause, orderByClause, skip, limit, createClause, setClause,
-        deleteClause, mergeClause, unwindClauses, withClauses, null, clausesInOrder, hasCreate, hasMerge, hasDelete);
+        deleteClause, mergeClause, unwindClauses, withClauses, null, null, clausesInOrder, hasCreate, hasMerge, hasDelete);
   }
 
   public SimpleCypherStatement(final String originalQuery, final List<MatchClause> matchClauses,
@@ -89,7 +90,7 @@ public class SimpleCypherStatement implements CypherStatement {
       final List<WithClause> withClauses, final List<CallClause> callClauses, final List<ClauseEntry> clausesInOrder,
       final boolean hasCreate, final boolean hasMerge, final boolean hasDelete) {
     this(originalQuery, matchClauses, whereClause, returnClause, orderByClause, skip, limit, createClause, setClause,
-        deleteClause, mergeClause, unwindClauses, withClauses, callClauses, null, clausesInOrder,
+        deleteClause, mergeClause, unwindClauses, withClauses, callClauses, null, null, clausesInOrder,
         hasCreate, hasMerge, hasDelete, false);
   }
 
@@ -98,6 +99,7 @@ public class SimpleCypherStatement implements CypherStatement {
       final Integer skip, final Integer limit, final CreateClause createClause, final SetClause setClause,
       final DeleteClause deleteClause, final MergeClause mergeClause, final List<UnwindClause> unwindClauses,
       final List<WithClause> withClauses, final List<CallClause> callClauses, final List<RemoveClause> removeClauses,
+      final List<ForeachClause> foreachClauses,
       final List<ClauseEntry> clausesInOrder,
       final boolean hasCreate, final boolean hasMerge, final boolean hasDelete, final boolean hasRemove) {
     this.originalQuery = originalQuery;
@@ -115,6 +117,7 @@ public class SimpleCypherStatement implements CypherStatement {
     this.withClauses = withClauses != null ? withClauses : new ArrayList<>();
     this.callClauses = callClauses != null ? callClauses : new ArrayList<>();
     this.removeClauses = removeClauses != null ? removeClauses : new ArrayList<>();
+    this.foreachClauses = foreachClauses != null ? foreachClauses : new ArrayList<>();
     this.clausesInOrder = clausesInOrder != null ? clausesInOrder : new ArrayList<>();
     this.hasCreate = hasCreate;
     this.hasMerge = hasMerge;
@@ -215,6 +218,11 @@ public class SimpleCypherStatement implements CypherStatement {
   @Override
   public List<RemoveClause> getRemoveClauses() {
     return removeClauses;
+  }
+
+  @Override
+  public List<ForeachClause> getForeachClauses() {
+    return foreachClauses;
   }
 
   public boolean hasRemove() {
