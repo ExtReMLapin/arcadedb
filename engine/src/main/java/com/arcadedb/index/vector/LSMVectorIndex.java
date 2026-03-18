@@ -2331,17 +2331,18 @@ public class LSMVectorIndex implements Index, IndexInternal {
       readLockHeld = true;
       try {
         // Phase 5+: Check if graph needs rebuilding due to pending mutations
-        // With periodic rebuilds (threshold=1000), we may have some pending mutations
-        if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() > 0) {
+        // Only rebuild once the configured mutation threshold has been reached to amortize rebuild cost
+        if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() >= getMutationsBeforeRebuild()) {
           // Graph is out of sync - need to rebuild before searching
           lock.readLock().unlock();
           readLockHeld = false;
           lock.writeLock().lock();
           try {
             // Double-check after acquiring write lock
-            if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() > 0) {
-              LogManager.instance().log(this, Level.FINE,
-                  "Rebuilding graph before search (accumulated " + mutationsSinceSerialize.get() + " mutations)");
+            if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() >= getMutationsBeforeRebuild()) {
+              LogManager.instance().log(this, Level.INFO,
+                  "Rebuilding graph before search (accumulated " + mutationsSinceSerialize.get() + " mutations >= threshold "
+                      + getMutationsBeforeRebuild() + ")");
               buildGraphFromScratch();
             }
             // Downgrade to read lock
@@ -2644,17 +2645,18 @@ public class LSMVectorIndex implements Index, IndexInternal {
     readLockHeld = true;
     try {
       // Phase 5+: Check if graph needs rebuilding due to pending mutations
-      // With periodic rebuilds (threshold=1000), we may have some pending mutations
-      if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() > 0) {
+      // Only rebuild once the configured mutation threshold has been reached to amortize rebuild cost
+      if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() >= getMutationsBeforeRebuild()) {
         // Graph is out of sync - need to rebuild before searching
         lock.readLock().unlock();
         readLockHeld = false;
         lock.writeLock().lock();
         try {
           // Double-check after acquiring write lock
-          if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() > 0) {
-            LogManager.instance().log(this, Level.FINE,
-                "Rebuilding graph before search (accumulated " + mutationsSinceSerialize.get() + " mutations)");
+          if (graphState == GraphState.MUTABLE && mutationsSinceSerialize.get() >= getMutationsBeforeRebuild()) {
+            LogManager.instance().log(this, Level.INFO,
+                "Rebuilding graph before search (accumulated " + mutationsSinceSerialize.get() + " mutations >= threshold "
+                    + getMutationsBeforeRebuild() + ")");
             buildGraphFromScratch();
           }
           // Downgrade to read lock
