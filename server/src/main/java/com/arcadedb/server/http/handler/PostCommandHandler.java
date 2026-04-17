@@ -51,10 +51,9 @@ public class PostCommandHandler extends AbstractQueryHandler {
     if (json == null)
       return new ExecutionResponse(400, "{ \"error\" : \"Command text is null\"}");
 
-    // Issue #3864 follow-up: use the optimized toMap so JSON numeric arrays (e.g. vector
-    // embeddings inside `params.batch[*].vector`) are returned as primitive double[]/long[]
-    // instead of List<Double>, avoiding millions of boxed Number allocations per request.
+    long deserializationStart = System.nanoTime();
     final Map<String, Object> requestMap = json.toMap(true);
+    long deserializationTime = System.nanoTime() - deserializationStart;
 
     if (requestMap.get("command") == null)
       throw new IllegalArgumentException("command missing");
@@ -113,7 +112,9 @@ public class PostCommandHandler extends AbstractQueryHandler {
       return new ExecutionResponse(202, "{ \"result\": \"Command accepted for asynchronous execution\"}");
     } else {
 
+      long engineStart = System.nanoTime();
       final ResultSet qResult = executeCommand(database, language, command, paramMap);
+      long engineTime = System.nanoTime() - engineStart;
 
       final JSONObject response = new JSONObject();
       response.put("user", user != null ? user.getName() : null);
@@ -126,17 +127,39 @@ public class PostCommandHandler extends AbstractQueryHandler {
         while (qResult.hasNext()) {
           qResult.next();
         }
+        
+        long serializationStart = System.nanoTime();
         serializeResultSet(database, serializer, limit, response, qResult);
+        long serializationTime = System.nanoTime() - serializationStart;
+        
         response.put("explain", explainText);
         response.put("explainPlan", executionPlan.toResult().toJSON());
+
+        if ("detailed".equalsIgnoreCase(profileExecution)) {
+          String overhead = String.format(
+              "\nProtocol Overhead:\n- Deserialization: %.3f ms\n- Engine Execution: %.3f ms\n- Serialization: %.3f ms\n- Total Overhead: %.3f ms\n",
+              deserializationTime / 1_000_000.0, engineTime / 1_000_000.0, serializationTime / 1_000_000.0, (deserializationTime + serializationTime) / 1_000_000.0);
+          response.put("explain", overhead + explainText);
+        }
       } else {
+        long serializationStart = System.nanoTime();
         serializeResultSet(database, serializer, limit, response, qResult);
+        long serializationTime = System.nanoTime() - serializationStart;
 
         if (qResult != null && qResult.getExecutionPlan().isPresent() &&
             (profileExecution != null ||
                 command.toUpperCase(Locale.ENGLISH).startsWith("PROFILE "))) {
           final var executionPlan = qResult.getExecutionPlan().get();
-          response.put("explain", executionPlan.prettyPrint(0, 2));
+          String explainText = executionPlan.prettyPrint(0, 2);
+          
+          if ("detailed".equalsIgnoreCase(profileExecution)) {
+            String overhead = String.format(
+                "\nProtocol Overhead:\n- Deserialization: %.3f ms\n- Engine Execution: %.3f ms\n- Serialization: %.3f ms\n- Total Overhead: %.3f ms\n",
+                deserializationTime / 1_000_000.0, engineTime / 1_000_000.0, serializationTime / 1_000_000.0, (deserializationTime + serializationTime) / 1_000_000.0);
+            explainText = overhead + explainText;
+          }
+          
+          response.put("explain", explainText);
           response.put("explainPlan", executionPlan.toResult().toJSON());
         }
       }

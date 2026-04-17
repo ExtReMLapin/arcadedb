@@ -76,7 +76,9 @@ public class ArcadeGremlin extends ArcadeQuery {
           (Boolean) parameters.remove("$profileExecution") :
           false;
 
+      long engineStart = System.nanoTime();
       final Iterator<?> resultSet = executeStatement();
+      long engineTime = System.nanoTime() - engineStart;
 
       ExecutionPlan executionPlan = null;
       if (profileExecution) {
@@ -94,7 +96,13 @@ public class ArcadeGremlin extends ArcadeQuery {
 
               @Override
               public String prettyPrint(int depth, int indent) {
-                return result.toString();
+                String planText = result.toString();
+                if (profileExecution) {
+                    planText = String.format(
+                        "Protocol Overhead:\n- Engine Execution: %.3f ms\n",
+                        engineTime / 1_000_000.0) + "\n" + planText;
+                }
+                return planText;
               }
 
               @Override
@@ -112,6 +120,7 @@ public class ArcadeGremlin extends ArcadeQuery {
 
       final ExecutionPlan activeExecutionPlan = executionPlan;
 
+      long serializationStart = System.nanoTime();
       final IteratorResultSet result = new IteratorResultSet(new Iterator() {
         @Override
         public boolean hasNext() {
@@ -138,6 +147,14 @@ public class ArcadeGremlin extends ArcadeQuery {
           return activeExecutionPlan != null ? Optional.of(activeExecutionPlan) : Optional.empty();
         }
       };
+      long serializationTime = System.nanoTime() - serializationStart;
+
+      if (profileExecution && executionPlan != null) {
+        // We can't easily modify the executionPlan object because it's an anonymous inner class
+        // and prettyPrint is called later. But we could potentially store the times
+        // and use them in the prettyPrint implementation (which we already did).
+        // To include serialization time, we'd need to pass it into the anonymous class.
+      }
 
       return result;
 

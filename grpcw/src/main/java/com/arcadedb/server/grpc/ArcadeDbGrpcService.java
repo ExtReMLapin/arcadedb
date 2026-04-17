@@ -253,7 +253,9 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     boolean beganHere = false;
 
     try {
+      long deserializationStart = System.nanoTime();
       final Map<String, Object> params = GrpcTypeConverter.convertParameters(req.getParametersMap());
+      long deserializationTime = System.nanoTime() - deserializationStart;
 
       final String language = langOrDefault(req.getLanguage());
 
@@ -296,7 +298,9 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
       LogManager.instance().log(this, Level.FINE, "executeCommandInternal(): command = %s", req.getCommand());
 
+      long engineStart = System.nanoTime();
       try (ResultSet rs = db.command(language, req.getCommand(), params)) {
+        long engineTime = System.nanoTime() - engineStart;
 
         if (rs != null) {
 
@@ -308,6 +312,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
             int emitted = 0;
 
+            long serializationStart = System.nanoTime();
             while (rs.hasNext()) {
 
               Result result = rs.next();
@@ -335,6 +340,14 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
               }
 
             }
+            long serializationTime = System.nanoTime() - serializationStart;
+
+            if (params.containsKey("$profileExecution") && Boolean.TRUE.equals(params.get("$profileExecution"))) {
+                String overhead = String.format(
+                    "\nProtocol Overhead:\n- Deserialization: %.3f ms\n- Engine Execution: %.3f ms\n- Serialization: %.3f ms\n- Total Overhead: %.3f ms\n",
+                    deserializationTime / 1_000_000.0, engineTime / 1_000_000.0, serializationTime / 1_000_000.0, (deserializationTime + serializationTime) / 1_000_000.0);
+                out.setMessage(overhead + "OK");
+            }
           } else {
 
             LogManager.instance().log(this, Level.FINE, "executeCommandInternal(): not returning rows ... rs = %s", rs);
@@ -351,6 +364,14 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
                     affected += n.longValue();
                 }
               }
+            }
+            
+            long serializationTime = 0;
+            if (params.containsKey("$profileExecution") && Boolean.TRUE.equals(params.get("$profileExecution"))) {
+                String overhead = String.format(
+                    "\nProtocol Overhead:\n- Deserialization: %.3f ms\n- Engine Execution: %.3f ms\n- Serialization: %.3f ms\n- Total Overhead: %.3f ms\n",
+                    deserializationTime / 1_000_000.0, engineTime / 1_000_000.0, serializationTime / 1_000_000.0, (deserializationTime + serializationTime) / 1_000_000.0);
+                out.setMessage(overhead + "OK");
             }
           }
         }

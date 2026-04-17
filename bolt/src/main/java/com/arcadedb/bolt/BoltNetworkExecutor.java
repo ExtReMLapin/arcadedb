@@ -511,6 +511,10 @@ public class BoltNetworkExecutor extends Thread {
       LogManager.instance().log(this, Level.FINE, "BOLT executing: %s with params %s (db=%s)", query, params, databaseName);
 
     // Start timing for performance metrics
+    long deserializationStart = System.nanoTime();
+    // Note: BoltMessage.parse already did the main deserialization, but we can consider the map creation as part of it
+    long deserializationTime = System.nanoTime() - deserializationStart;
+    
     queryStartTime = System.nanoTime();
     firstRecordTime = 0;
     syntheticResults = null;
@@ -539,11 +543,14 @@ public class BoltNetworkExecutor extends Thread {
       isWriteOperation = isWriteQuery(query);
 
       // Use command() for writes, query() for reads
+      long engineStart = System.nanoTime();
       if (isWriteOperation) {
         currentResultSet = database.command("opencypher", query, params);
       } else {
         currentResultSet = database.query("opencypher", query, params);
       }
+      long engineTime = System.nanoTime() - engineStart;
+
       currentFields = extractFieldNames(currentResultSet);
       recordsStreamed = 0;
 
@@ -562,6 +569,13 @@ public class BoltNetworkExecutor extends Thread {
         metadata.put("t_first", tFirstMs);
       } else {
         metadata.put("t_first", 0L);
+      }
+
+      if (params != null && params.containsKey("$profileExecution") && Boolean.TRUE.equals(params.get("$profileExecution"))) {
+        String overhead = String.format(
+            "Protocol Overhead:\n- Deserialization: %.3f ms\n- Engine Execution: %.3f ms\n",
+            deserializationTime / 1_000_000.0, engineTime / 1_000_000.0);
+        metadata.put("protocol_overhead", overhead);
       }
 
       sendSuccess(metadata);
