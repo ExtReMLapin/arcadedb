@@ -34,14 +34,14 @@
     <name>ArcadeDB Gremlin</name>
 
     <properties>
-        <gremlin.version>3.8.0</gremlin.version>
+        <gremlin.version>3.8.1</gremlin.version>
         <translation.version>1.0.4</translation.version>
         <snakeyaml.version>2.6</snakeyaml.version>
-        <netty.version>4.2.10.Final</netty.version>
-        <commons-configuration2.version>2.13.0</commons-configuration2.version>
+        <netty.version>4.2.12.Final</netty.version>
+        <commons-configuration2.version>2.14.0</commons-configuration2.version>
         <commons-beanutils.version>1.11.0</commons-beanutils.version>
         <commons-lang3.version>3.20.0</commons-lang3.version>
-        <groovy.version>5.0.4</groovy.version>
+        <groovy.version>4.0.28</groovy.version>
         <antlr4.version>4.9.1</antlr4.version>
     </properties>
 
@@ -137,11 +137,6 @@
             </exclusions>
         </dependency>
 
-        <dependency>
-            <groupId>org.opencypher.gremlin</groupId>
-            <artifactId>translation</artifactId>
-            <version>${translation.version}</version>
-        </dependency>
 
         <!-- ARCADEDB DOES NOT USE THIS LIBRARY BUT GREMLIN DOES. REPLACING IT WITH THE LAST RELEASE BECAUSE OF THE SECURITY ISSUE
          https://nvd.nist.gov/vuln/detail/CVE-2022-1471 -->

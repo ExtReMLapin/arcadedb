@@ -18,19 +18,29 @@
  */
 package com.arcadedb.gremlin;
 
+import com.arcadedb.database.Database;
+import com.arcadedb.graph.GraphTraversalProvider;
+import com.arcadedb.graph.GraphTraversalProviderRegistry;
 import com.arcadedb.index.IndexCursor;
 import com.arcadedb.index.TypeIndex;
 import com.arcadedb.serializer.BinaryComparator;
 import org.apache.tinkerpop.gremlin.process.traversal.Compare;
+import org.apache.tinkerpop.gremlin.process.traversal.P;
 import org.apache.tinkerpop.gremlin.process.traversal.Step;
 import org.apache.tinkerpop.gremlin.process.traversal.Traversal;
 import org.apache.tinkerpop.gremlin.process.traversal.TraversalStrategy;
+import org.apache.tinkerpop.gremlin.process.traversal.step.TraversalParent;
 import org.apache.tinkerpop.gremlin.process.traversal.step.filter.HasStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.IsStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.TraversalFilterStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.filter.WhereTraversalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.CountGlobalStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.map.GraphStep;
+import org.apache.tinkerpop.gremlin.process.traversal.step.map.VertexStep;
 import org.apache.tinkerpop.gremlin.process.traversal.step.util.HasContainer;
 import org.apache.tinkerpop.gremlin.process.traversal.strategy.AbstractTraversalStrategy;
 import org.apache.tinkerpop.gremlin.process.traversal.strategy.optimization.InlineFilterStrategy;
+import org.apache.tinkerpop.gremlin.structure.Vertex;
 
 import java.util.*;
 import java.util.stream.*;
@@ -144,6 +154,132 @@ public class ArcadeTraversalStrategy extends AbstractTraversalStrategy<Traversal
           }
         }
       }
+    }
+
+    // GAV optimization: replace VertexStep with CSR-accelerated steps, then fuse consecutive ones
+    applyGAVOptimization(traversal);
+
+    // GAV optimization: replace where(outE().count().is(...)) with O(1) degree check
+    applyEdgeCountFilterOptimization(traversal);
+  }
+
+  /**
+   * Replaces TinkerPop VertexStep instances with GAV-accelerated steps when a CSR provider
+   * is available. Then fuses 2+ consecutive GAV steps into a single fused chain step.
+   */
+  private void applyGAVOptimization(final Traversal.Admin<?, ?> traversal) {
+    if (traversal.getGraph().isEmpty())
+      return;
+    final ArcadeGraph graph = (ArcadeGraph) traversal.getGraph().get();
+    if (!(graph.getDatabase() instanceof Database db))
+      return;
+
+    // Phase 1: Replace VertexStep → ArcadeGAVVertexStep when provider covers the edge labels
+    final List<Step> steps = traversal.getSteps();
+    for (int i = 0; i < steps.size(); i++) {
+      final Step step = steps.get(i);
+      if (step instanceof VertexStep<?> vertexStep && vertexStep.returnsVertex()) {
+        final String[] edgeLabels = vertexStep.getEdgeLabels();
+        final GraphTraversalProvider provider = edgeLabels.length == 0
+            ? GraphTraversalProviderRegistry.findProvider(db)
+            : GraphTraversalProviderRegistry.findProvider(db, edgeLabels);
+        if (provider != null) {
+          final ArcadeGAVVertexStep gavStep = new ArcadeGAVVertexStep(
+              graph, vertexStep, provider, vertexStep.getDirection(), edgeLabels);
+          traversal.removeStep(i);
+          traversal.addStep(i, gavStep);
+        }
+      }
+    }
+
+    // Phase 2: Fuse consecutive ArcadeGAVVertexStep instances into a single ArcadeGAVFusedStep
+    final List<Step> updatedSteps = traversal.getSteps();
+    int i = 0;
+    while (i < updatedSteps.size()) {
+      if (updatedSteps.get(i) instanceof ArcadeGAVVertexStep firstGavStep) {
+        // Collect consecutive GAV steps with the same provider
+        final List<ArcadeGAVVertexStep> chain = new ArrayList<>();
+        chain.add(firstGavStep);
+        int j = i + 1;
+        while (j < updatedSteps.size() && updatedSteps.get(j) instanceof ArcadeGAVVertexStep nextGavStep
+            && nextGavStep.getProvider() == firstGavStep.getProvider()) {
+          chain.add(nextGavStep);
+          j++;
+        }
+
+        if (chain.size() >= 2) {
+          // Fuse the chain into a single step
+          final ArcadeGAVFusedStep fusedStep = new ArcadeGAVFusedStep(
+              traversal, graph, firstGavStep.getProvider(), chain);
+          // Remove all steps in the chain (backwards to preserve indices)
+          for (int k = j - 1; k >= i; k--)
+            traversal.removeStep(k);
+          traversal.addStep(i, fusedStep);
+          // Don't increment i — check if next step is also fusible (it won't be, but safe)
+        }
+      }
+      i++;
+    }
+  }
+
+  /**
+   * Detects {@code where(outE('X').count().is(predicate))} patterns and replaces the entire
+   * where step with an {@link ArcadeEdgeCountFilterStep} that uses GAV's O(1) countEdges.
+   */
+  @SuppressWarnings("unchecked")
+  private void applyEdgeCountFilterOptimization(final Traversal.Admin<?, ?> traversal) {
+    if (traversal.getGraph().isEmpty())
+      return;
+    final ArcadeGraph graph = (ArcadeGraph) traversal.getGraph().get();
+    if (!(graph.getDatabase() instanceof Database db))
+      return;
+
+    final List<Step> steps = traversal.getSteps();
+    for (int i = 0; i < steps.size(); i++) {
+      final Step step = steps.get(i);
+      // Match WhereTraversalStep or TraversalFilterStep containing the edge count pattern
+      if (!(step instanceof TraversalParent parent))
+        continue;
+
+      final List<?> children;
+      if (step instanceof WhereTraversalStep<?>)
+        children = ((WhereTraversalStep<?>) step).getLocalChildren();
+      else if (step instanceof TraversalFilterStep<?>)
+        children = ((TraversalFilterStep<?>) step).getLocalChildren();
+      else
+        continue;
+
+      if (children.size() != 1)
+        continue;
+
+      final List<Step> subSteps = ((Traversal.Admin<?, ?>) children.get(0)).getSteps();
+      if (subSteps.size() != 3)
+        continue;
+
+      // Check pattern: VertexStep(Edge) → CountGlobalStep → IsStep
+      if (!(subSteps.get(0) instanceof VertexStep<?> vertexStep) || !vertexStep.returnsEdge())
+        continue;
+      if (!(subSteps.get(1) instanceof CountGlobalStep))
+        continue;
+      if (!(subSteps.get(2) instanceof IsStep<?> isStep))
+        continue;
+
+      final String[] edgeLabels = vertexStep.getEdgeLabels();
+      final GraphTraversalProvider provider = edgeLabels.length == 0
+          ? GraphTraversalProviderRegistry.findProvider(db)
+          : GraphTraversalProviderRegistry.findProvider(db, edgeLabels);
+      if (provider == null)
+        continue;
+
+      // Extract predicate from IsStep
+      final P<?> rawPredicate = isStep.getPredicate();
+      final P<Long> predicate = (P<Long>) rawPredicate;
+
+      // Replace the where/filter step with our O(1) degree check
+      final ArcadeEdgeCountFilterStep filterStep = new ArcadeEdgeCountFilterStep(
+          traversal, provider, vertexStep.getDirection(), edgeLabels, predicate::test);
+      traversal.removeStep(i);
+      traversal.addStep(i, filterStep);
     }
   }
 

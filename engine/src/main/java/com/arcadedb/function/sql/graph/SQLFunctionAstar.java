@@ -24,7 +24,10 @@ import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.RID;
 import com.arcadedb.database.Record;
 import com.arcadedb.graph.Edge;
+import com.arcadedb.graph.GraphTraversalProvider;
+import com.arcadedb.graph.GraphTraversalProviderRegistry;
 import com.arcadedb.graph.Vertex;
+import com.arcadedb.function.sql.FunctionOptions;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.MultiValue;
 import com.arcadedb.query.sql.executor.Result;
@@ -52,6 +55,10 @@ import java.util.Set;
  */
 public class SQLFunctionAstar extends SQLFunctionHeuristicPathFinderAbstract {
   public static final String NAME = "astar";
+
+  private static final Set<String> OPTIONS = Set.of(PARAM_DIRECTION, PARAM_EDGE_TYPE_NAMES, PARAM_VERTEX_AXIS_NAMES,
+      PARAM_PARALLEL, PARAM_MAX_DEPTH, PARAM_EMPTY_IF_MAX_DEPTH, PARAM_TIE_BREAKER, PARAM_D_FACTOR, PARAM_HEURISTIC_FORMULA,
+      PARAM_CUSTOM_HEURISTIC_FORMULA);
 
   private         String              paramWeightFieldName = "weight";
   private         long                currentDepth         = 0;
@@ -164,24 +171,24 @@ public class SQLFunctionAstar extends SQLFunctionHeuristicPathFinderAbstract {
       }
 
       closedSet.add(current);
-      for (final Edge neighborEdge : getNeighborEdges(current)) {
 
-        final Vertex neighbor = getNeighbor(current, neighborEdge, graph);
+      // Try CSR + edge property columns first for O(1) neighbor + weight access
+      final Map<Vertex, Double> neighborWeights = getNeighborWeightsCSR(current, ctx);
+      for (final Map.Entry<Vertex, Double> entry : neighborWeights.entrySet()) {
+        final Vertex neighbor = entry.getKey();
         // Ignore the neighbor which is already evaluated.
-        if (closedSet.contains(neighbor)) {
+        if (closedSet.contains(neighbor))
           continue;
-        }
         // The distance from start to a neighbor
-        final double tentative_gScore = gScore.get(current) + getDistance(neighborEdge);
+        final double tentative_gScore = gScore.get(current) + entry.getValue();
         final boolean contains = open.contains(neighbor);
 
         if (!contains || tentative_gScore < gScore.get(neighbor)) {
           gScore.put(neighbor, tentative_gScore);
           fScore.put(neighbor, tentative_gScore + getHeuristicCost(neighbor, current, goal, ctx));
 
-          if (contains) {
+          if (contains)
             open.remove(neighbor);
-          }
           open.offer(neighbor);
           cameFrom.put(neighbor, current);
         }
@@ -218,53 +225,102 @@ public class SQLFunctionAstar extends SQLFunctionHeuristicPathFinderAbstract {
     final Set<Edge> neighbors = new HashSet<Edge>();
     if (node != null) {
       for (final Edge v : node.getEdges(paramDirection, paramEdgeTypeNames)) {
-        final Edge ov = v;
-        if (ov != null)
-          neighbors.add(ov);
+        if (v != null)
+          neighbors.add(v);
       }
     }
     return neighbors;
   }
 
+  /**
+   * Returns neighbor vertices with their edge weights using CSR + edge property columns when available.
+   * Falls back to OLTP edge traversal when GAV doesn't have edge properties or doesn't cover the node.
+   */
+  protected Map<Vertex, Double> getNeighborWeightsCSR(final Vertex node, final CommandContext ctx) {
+    final Map<Vertex, Double> result = new HashMap<>();
+    if (node == null)
+      return result;
+
+    final GraphTraversalProvider provider = GraphTraversalProviderRegistry.findProvider(
+        ctx.getDatabase(), paramEdgeTypeNames);
+    if (provider != null && provider.hasEdgeProperties()) {
+      final int nodeId = provider.getNodeId(node.getIdentity());
+      if (nodeId >= 0) {
+        final int[] neighborIds = paramEdgeTypeNames != null && paramEdgeTypeNames.length > 0
+            ? provider.getNeighborIds(nodeId, paramDirection, paramEdgeTypeNames)
+            : provider.getNeighborIds(nodeId, paramDirection);
+        final String edgeType = paramEdgeTypeNames != null && paramEdgeTypeNames.length > 0 ? paramEdgeTypeNames[0] : null;
+        for (int i = 0; i < neighborIds.length; i++) {
+          final RID neighborRid = provider.getRID(neighborIds[i]);
+          if (neighborRid != null) {
+            double weight = MIN;
+            if (edgeType != null) {
+              final Object wObj = provider.getEdgeProperty(nodeId, i, paramDirection, edgeType, paramWeightFieldName);
+              if (wObj instanceof Number num)
+                weight = num.doubleValue();
+            }
+            try {
+              result.put(neighborRid.asVertex(), weight);
+            } catch (final Exception e) {
+              // deleted vertex — skip
+            }
+          }
+        }
+        return result;
+      }
+    }
+
+    // OLTP fallback
+    for (final Edge edge : node.getEdges(paramDirection, paramEdgeTypeNames)) {
+      final Vertex neighbor = getNeighbor(node, edge, ctx.getDatabase());
+      if (neighbor != null)
+        result.put(neighbor, getDistance(edge));
+    }
+    return result;
+  }
+
   private void bindAdditionalParams(final Object additionalParams, final SQLFunctionAstar context) {
-    if (additionalParams == null) {
+    if (additionalParams == null)
       return;
-    }
-    Map<String, Object> mapParams = null;
-    if (additionalParams instanceof Map) {
-      mapParams = (Map) additionalParams;
-    } else if (additionalParams instanceof Identifiable) {
-      mapParams = ((Document) ((Identifiable) additionalParams).getRecord()).toMap();
-    }
-    if (mapParams != null) {
-      context.paramEdgeTypeNames = stringArray(mapParams.get(SQLFunctionAstar.PARAM_EDGE_TYPE_NAMES));
-      context.paramVertexAxisNames = stringArray(mapParams.get(SQLFunctionAstar.PARAM_VERTEX_AXIS_NAMES));
-      if (mapParams.get(SQLFunctionAstar.PARAM_DIRECTION) != null) {
-        if (mapParams.get(SQLFunctionAstar.PARAM_DIRECTION) instanceof String) {
-          context.paramDirection = Vertex.DIRECTION.valueOf(
-              stringOrDefault(mapParams.get(SQLFunctionAstar.PARAM_DIRECTION), "OUT").toUpperCase(Locale.ENGLISH));
-        } else {
-          context.paramDirection = (Vertex.DIRECTION) mapParams.get(SQLFunctionAstar.PARAM_DIRECTION);
-        }
-      }
 
-      context.paramParallel = booleanOrDefault(mapParams.get(SQLFunctionAstar.PARAM_PARALLEL), false);
-      context.paramMaxDepth = longOrDefault(mapParams.get(SQLFunctionAstar.PARAM_MAX_DEPTH), context.paramMaxDepth);
-      context.paramEmptyIfMaxDepth = booleanOrDefault(mapParams.get(SQLFunctionAstar.PARAM_EMPTY_IF_MAX_DEPTH),
-          context.paramEmptyIfMaxDepth);
-      context.paramTieBreaker = booleanOrDefault(mapParams.get(SQLFunctionAstar.PARAM_TIE_BREAKER), context.paramTieBreaker);
-      context.paramDFactor = doubleOrDefault(mapParams.get(SQLFunctionAstar.PARAM_D_FACTOR), context.paramDFactor);
-      if (mapParams.get(SQLFunctionAstar.PARAM_HEURISTIC_FORMULA) != null) {
-        if (mapParams.get(SQLFunctionAstar.PARAM_HEURISTIC_FORMULA) instanceof String) {
-          context.paramHeuristicFormula = SQLHeuristicFormula.valueOf(
-              stringOrDefault(mapParams.get(SQLFunctionAstar.PARAM_HEURISTIC_FORMULA), "MANHATTAN").toUpperCase(Locale.ENGLISH));
-        } else {
-          context.paramHeuristicFormula = (SQLHeuristicFormula) mapParams.get(SQLFunctionAstar.PARAM_HEURISTIC_FORMULA);
-        }
-      }
+    final Map<?, ?> rawMap;
+    if (additionalParams instanceof Map<?, ?> map)
+      rawMap = map;
+    else if (additionalParams instanceof Identifiable identifiable)
+      rawMap = ((Document) identifiable.getRecord()).toMap();
+    else
+      return;
 
-      context.paramCustomHeuristicFormula = stringOrDefault(mapParams.get(SQLFunctionAstar.PARAM_CUSTOM_HEURISTIC_FORMULA), "");
+    final FunctionOptions opts = new FunctionOptions(NAME, rawMap, OPTIONS);
+
+    if (opts.containsKey(PARAM_EDGE_TYPE_NAMES))
+      context.paramEdgeTypeNames = stringArray(opts.get(PARAM_EDGE_TYPE_NAMES));
+    if (opts.containsKey(PARAM_VERTEX_AXIS_NAMES))
+      context.paramVertexAxisNames = stringArray(opts.get(PARAM_VERTEX_AXIS_NAMES));
+
+    if (opts.containsKey(PARAM_DIRECTION)) {
+      final Object raw = opts.get(PARAM_DIRECTION);
+      if (raw instanceof Vertex.DIRECTION direction)
+        context.paramDirection = direction;
+      else
+        context.paramDirection = Vertex.DIRECTION.valueOf(raw.toString().toUpperCase(Locale.ENGLISH));
     }
+
+    context.paramParallel = opts.getBoolean(PARAM_PARALLEL, context.paramParallel);
+    context.paramMaxDepth = opts.getLong(PARAM_MAX_DEPTH, context.paramMaxDepth);
+    context.paramEmptyIfMaxDepth = opts.getBoolean(PARAM_EMPTY_IF_MAX_DEPTH, context.paramEmptyIfMaxDepth);
+    context.paramTieBreaker = opts.getBoolean(PARAM_TIE_BREAKER, context.paramTieBreaker);
+    context.paramDFactor = opts.getDouble(PARAM_D_FACTOR, context.paramDFactor);
+
+    if (opts.containsKey(PARAM_HEURISTIC_FORMULA)) {
+      final Object raw = opts.get(PARAM_HEURISTIC_FORMULA);
+      if (raw instanceof SQLHeuristicFormula formula)
+        context.paramHeuristicFormula = formula;
+      else
+        context.paramHeuristicFormula = SQLHeuristicFormula.valueOf(raw.toString().toUpperCase(Locale.ENGLISH));
+    }
+
+    context.paramCustomHeuristicFormula = opts.getString(PARAM_CUSTOM_HEURISTIC_FORMULA, context.paramCustomHeuristicFormula);
   }
 
   public String getSyntax() {

@@ -19,9 +19,11 @@
 package com.arcadedb.engine;
 
 import com.arcadedb.database.Binary;
+import com.arcadedb.log.LogManager;
 
 import java.nio.*;
 import java.util.*;
+import java.util.logging.*;
 
 /**
  * Contains the page content to be shared across threads.
@@ -37,7 +39,17 @@ public class CachedPage {
 
   public CachedPage(final MutablePage page, final boolean copyBuffer) {
     this.pageId = page.pageId;
-    this.content = copyBuffer ? page.content.copy() : page.content;
+    if (copyBuffer) {
+      // Deep copy: duplicate the full backing array so the cached copy is completely independent
+      // from the original MutablePage. Binary.copy() only creates a new ByteBuffer view over the
+      // SAME array, which is not safe when the original page is still reachable (e.g. from the
+      // async flush thread's queue).
+      final byte[] srcArray = page.content.getContent();
+      final byte[] copied = java.util.Arrays.copyOf(srcArray, srcArray.length);
+      this.content = new Binary(copied, page.content.size());
+    } else {
+      this.content = page.content;
+    }
     this.size = page.size;
     this.version = page.version;
   }
@@ -50,7 +62,14 @@ public class CachedPage {
 
   public void loadMetadata() {
     version = content.getInt(BasePage.PAGE_VERSION_OFFSET);
-    content.size(content.getInt(BasePage.PAGE_CONTENTSIZE_OFFSET));
+    int contentSize = content.getInt(BasePage.PAGE_CONTENTSIZE_OFFSET);
+    if (contentSize < 0 || contentSize > size) {
+      // Corrupted page metadata - clamp to physical page size and log a warning
+      LogManager.instance().log(this, Level.WARNING,
+          "Page %s has invalid content size %d (physical size %d), clamping to physical size", pageId, contentSize, size);
+      contentSize = size;
+    }
+    content.size(contentSize);
   }
 
   public ImmutablePage useAsImmutable() {

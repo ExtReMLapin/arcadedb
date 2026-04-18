@@ -26,6 +26,7 @@ import com.arcadedb.graph.NeighborView;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.VertexType;
+import com.arcadedb.utility.LongLongHashMap;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -96,7 +97,7 @@ public final class PairHashJoinOp implements CountOp {
     // BUILD: for single-hop arms, use NeighborView for direct edge iteration
     // instead of per-node walkArm (avoids ~6M getNeighborIds method calls).
     // For multi-hop arms, fall back to per-node walkArm.
-    final HashMap<Long, Long> pairCounts = new HashMap<>();
+    final LongLongHashMap pairCounts = new LongLongHashMap();
 
     final boolean arm1SingleHop = arm1EdgeTypes.length == 1;
     final boolean arm2SingleHop = arm2EdgeTypes.length == 1;
@@ -145,7 +146,7 @@ public final class PairHashJoinOp implements CountOp {
           continue;
         for (final int ep1 : ep1Ids)
           for (final int ep2 : ep2Ids)
-            pairCounts.merge(CSRCountUtils.packPair(ep1, ep2), 1L, Long::sum);
+            pairCounts.increment(CSRCountUtils.packPair(ep1, ep2));
       }
     }
 
@@ -153,21 +154,14 @@ public final class PairHashJoinOp implements CountOp {
     long total = 0;
     if (probeViewFallback != null) {
       final int[] probeNbrs = probeViewFallback.neighbors();
-      for (int p1 = 0; p1 < nodeCount; p1++) {
-        for (int j = probeViewFallback.offset(p1), end = probeViewFallback.offsetEnd(p1); j < end; j++) {
-          final Long cnt = pairCounts.get(CSRCountUtils.packPair(p1, probeNbrs[j]));
-          if (cnt != null)
-            total += cnt;
-        }
-      }
+      for (int p1 = 0; p1 < nodeCount; p1++)
+        for (int j = probeViewFallback.offset(p1), end = probeViewFallback.offsetEnd(p1); j < end; j++)
+          total += pairCounts.get(CSRCountUtils.packPair(p1, probeNbrs[j]), 0);
     } else {
       for (int p1 = 0; p1 < nodeCount; p1++) {
         final int[] neighbors = provider.getNeighborIds(p1, probeDirection, probeEdgeType);
-        for (final int p2 : neighbors) {
-          final Long cnt = pairCounts.get(CSRCountUtils.packPair(p1, p2));
-          if (cnt != null)
-            total += cnt;
-        }
+        for (final int p2 : neighbors)
+          total += pairCounts.get(CSRCountUtils.packPair(p1, p2), 0);
       }
     }
     return total;
@@ -179,8 +173,8 @@ public final class PairHashJoinOp implements CountOp {
 
     for (final Iterator<? extends Identifiable> it = db.iterateType(buildStartLabel, true); it.hasNext(); ) {
       final Vertex start = it.next().asVertex();
-      final List<RID> ep1List = walkArmOLTP(start, arm1EdgeTypes, arm1Directions, arm1IntermediateLabels);
-      final List<RID> ep2List = walkArmOLTP(start, arm2EdgeTypes, arm2Directions, arm2IntermediateLabels);
+      final List<RID> ep1List = walkArmOLTP(db, start, arm1EdgeTypes, arm1Directions, arm1IntermediateLabels);
+      final List<RID> ep2List = walkArmOLTP(db, start, arm2EdgeTypes, arm2Directions, arm2IntermediateLabels);
       for (final RID ep1 : ep1List)
         for (final RID ep2 : ep2List)
           pairCounts.merge(ep1 + "|" + ep2, 1L, Long::sum);
@@ -192,9 +186,8 @@ public final class PairHashJoinOp implements CountOp {
         continue;
       for (final Iterator<? extends Identifiable> it = db.iterateType(dt.getName(), false); it.hasNext(); ) {
         final Vertex p1 = it.next().asVertex();
-        for (final Iterator<Vertex> vIt = p1.getVertices(probeDirection, probeEdgeType).iterator(); vIt.hasNext(); ) {
-          final Vertex p2 = vIt.next();
-          final Long cnt = pairCounts.get(p1.getIdentity() + "|" + p2.getIdentity());
+        for (final RID p2Rid : p1.getConnectedVertexRIDs(probeDirection, probeEdgeType)) {
+          final Long cnt = pairCounts.get(p1.getIdentity() + "|" + p2Rid);
           if (cnt != null)
             total += cnt;
         }
@@ -203,25 +196,29 @@ public final class PairHashJoinOp implements CountOp {
     return total;
   }
 
-  private List<RID> walkArmOLTP(final Vertex start, final String[] edgeTypes,
+  private List<RID> walkArmOLTP(final Database db, final Vertex start, final String[] edgeTypes,
       final Vertex.DIRECTION[] directions, final String[] intermediateLabels) {
-    List<Vertex> current = List.of(start);
+    List<RID> current = List.of(start.getIdentity());
     for (int hop = 0; hop < edgeTypes.length; hop++) {
+      final Set<Integer> labelBuckets;
       final String label = intermediateLabels != null ? intermediateLabels[hop] : null;
-      final List<Vertex> next = new ArrayList<>();
-      for (final Vertex v : current)
-        for (final Iterator<Vertex> it = v.getVertices(directions[hop], edgeTypes[hop]).iterator(); it.hasNext(); ) {
-          final Vertex neighbor = it.next();
-          if (label != null && !neighbor.getType().instanceOf(label))
+      if (label != null && db.getSchema().existsType(label))
+        labelBuckets = new HashSet<>(db.getSchema().getType(label).getBucketIds(true));
+      else
+        labelBuckets = null;
+
+      final List<RID> next = new ArrayList<>();
+      for (final RID rid : current) {
+        final Vertex v = rid.asVertex();
+        for (final RID neighborRid : v.getConnectedVertexRIDs(directions[hop], edgeTypes[hop])) {
+          if (labelBuckets != null && !labelBuckets.contains(neighborRid.getBucketId()))
             continue;
-          next.add(neighbor);
+          next.add(neighborRid);
         }
+      }
       current = next;
     }
-    final List<RID> result = new ArrayList<>(current.size());
-    for (final Vertex v : current)
-      result.add(v.getIdentity());
-    return result;
+    return current;
   }
 
   /**
@@ -231,6 +228,9 @@ public final class PairHashJoinOp implements CountOp {
    * For Q2 (2.6M Comments, arm1=1 hop, arm2=2 hops, probe=KNOWS BOTH):
    * Each Comment: 1 arm1 lookup + 2 arm2 lookups + 1 binary search = ~5 ops.
    * Total: 2.6M × 5 = 13M ops at ~3ns = ~39ms (vs ~400ms with HashMap).
+   * <p>
+   * When arm2 has exactly 2 hops (the Q2 case), fuses the arm2 walk with the probe
+   * check inline to avoid allocating an intermediate int[] per build node.
    */
   private long buildAndProbeInline(final NeighborView arm1View, final NeighborView[] arm2Views,
       final Set<Integer>[] arm2Buckets, final NeighborView probeView,
@@ -239,21 +239,63 @@ public final class PairHashJoinOp implements CountOp {
     final int[] probeNbrs = probeView.neighbors();
     long total = 0;
 
+    // FAST PATH: 2-hop arm2 with fused inline walk+probe (avoids per-node array allocation)
+    if (arm2Views.length == 2) {
+      final int[] arm2Nbrs0 = arm2Views[0].neighbors();
+      final int[] arm2Nbrs1 = arm2Views[1].neighbors();
+      final Set<Integer> arm2Filter0 = arm2Buckets != null ? arm2Buckets[0] : null;
+      final Set<Integer> arm2Filter1 = arm2Buckets != null ? arm2Buckets[1] : null;
+
+      for (int startId = 0; startId < nodeCount; startId++) {
+        final int a1Start = arm1View.offset(startId);
+        final int a1End = arm1View.offsetEnd(startId);
+        if (a1Start == a1End) continue;
+
+        // Inline arm2 hop 0: startId → intermediate nodes
+        final int a2h0Start = arm2Views[0].offset(startId);
+        final int a2h0End = arm2Views[0].offsetEnd(startId);
+        if (a2h0Start == a2h0End) continue;
+
+        // For each arm1 endpoint, pre-fetch probe range
+        for (int i = a1Start; i < a1End; i++) {
+          final int ep1 = arm1Nbrs[i];
+          final int pStart = probeView.offset(ep1);
+          final int pEnd = probeView.offsetEnd(ep1);
+          if (pStart == pEnd) continue;
+
+          // Walk arm2 inline: hop0 → hop1 → binary search probe
+          for (int j = a2h0Start; j < a2h0End; j++) {
+            final int mid = arm2Nbrs0[j];
+            if (arm2Filter0 != null && !arm2Filter0.contains(bucketIds[mid])) continue;
+
+            final int a2h1Start = arm2Views[1].offset(mid);
+            final int a2h1End = arm2Views[1].offsetEnd(mid);
+            for (int k = a2h1Start; k < a2h1End; k++) {
+              final int ep2 = arm2Nbrs1[k];
+              if (arm2Filter1 != null && !arm2Filter1.contains(bucketIds[ep2])) continue;
+              if (java.util.Arrays.binarySearch(probeNbrs, pStart, pEnd, ep2) >= 0)
+                total++;
+            }
+          }
+        }
+      }
+      return total;
+    }
+
+    // GENERAL PATH: allocate arm2 endpoints array per build node
     for (int startId = 0; startId < nodeCount; startId++) {
       final int a1Start = arm1View.offset(startId);
       final int a1End = arm1View.offsetEnd(startId);
       if (a1Start == a1End) continue;
 
-      // Walk arm2 to get endpoints
       final int[] ep2Ids = walkArmWithViews(startId, arm2Views, arm2Buckets, bucketIds);
       if (ep2Ids.length == 0) continue;
 
-      // For each (ep1, ep2) pair, check if probe edge exists via binary search
       for (int i = a1Start; i < a1End; i++) {
         final int ep1 = arm1Nbrs[i];
         final int pStart = probeView.offset(ep1);
         final int pEnd = probeView.offsetEnd(ep1);
-        if (pStart == pEnd) continue; // ep1 has no probe edges
+        if (pStart == pEnd) continue;
 
         for (final int ep2 : ep2Ids) {
           if (java.util.Arrays.binarySearch(probeNbrs, pStart, pEnd, ep2) >= 0)
@@ -270,7 +312,7 @@ public final class PairHashJoinOp implements CountOp {
    * But for simpler pair-joins where both arms are 1 hop, this avoids all per-node method calls.
    */
   private void buildWithViews(final NeighborView arm1View, final NeighborView arm2View,
-      final Set<Integer>[] arm2Buckets, final HashMap<Long, Long> pairCounts,
+      final Set<Integer>[] arm2Buckets, final LongLongHashMap pairCounts,
       final int nodeCount, final GraphTraversalProvider provider) {
     final int[] arm1Nbrs = arm1View.neighbors();
     final int[] arm2Nbrs = arm2View.neighbors();
@@ -284,7 +326,7 @@ public final class PairHashJoinOp implements CountOp {
 
       for (int i = a1Start; i < a1End; i++)
         for (int j = a2Start; j < a2End; j++)
-          pairCounts.merge(CSRCountUtils.packPair(arm1Nbrs[i], arm2Nbrs[j]), 1L, Long::sum);
+          pairCounts.increment(CSRCountUtils.packPair(arm1Nbrs[i], arm2Nbrs[j]));
     }
   }
 
@@ -294,7 +336,7 @@ public final class PairHashJoinOp implements CountOp {
    * For Q2: arm1=HAS_CREATOR OUT (Comment→Person), arm2=REPLY_OF+HAS_CREATOR (Comment→Post→Person).
    */
   private void buildWithArm1View(final NeighborView arm1View, final GraphTraversalProvider provider,
-      final Set<Integer>[] arm2Buckets, final HashMap<Long, Long> pairCounts,
+      final Set<Integer>[] arm2Buckets, final LongLongHashMap pairCounts,
       final int nodeCount) {
     final int[] arm1Nbrs = arm1View.neighbors();
 
@@ -329,7 +371,7 @@ public final class PairHashJoinOp implements CountOp {
 
       for (int i = a1Start; i < a1End; i++)
         for (final int ep2 : ep2Ids)
-          pairCounts.merge(CSRCountUtils.packPair(arm1Nbrs[i], ep2), 1L, Long::sum);
+          pairCounts.increment(CSRCountUtils.packPair(arm1Nbrs[i], ep2));
     }
   }
 

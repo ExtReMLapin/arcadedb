@@ -23,7 +23,9 @@ package com.arcadedb.query.sql.parser;
 import com.arcadedb.database.Database;
 import com.arcadedb.exception.CommandExecutionException;
 import com.arcadedb.exception.CommandSQLParsingException;
+import com.arcadedb.index.TypeIndex;
 import com.arcadedb.index.lsm.LSMTreeIndexAbstract;
+import com.arcadedb.index.vector.LSMVectorIndex;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.InternalResultSet;
 import com.arcadedb.query.sql.executor.Result;
@@ -154,6 +156,12 @@ public class CreateIndexStatement extends DDLStatement {
     builder.withUnique(unique);
     builder.withPageSize(LSMTreeIndexAbstract.DEF_PAGE_SIZE);
     builder.withNullStrategy(nullStrategy);
+
+    // Pass collation settings (e.g., CI for case-insensitive)
+    final List<String> collations = new ArrayList<>();
+    for (final Property prop : propertyList)
+      collations.add(prop.collate != null ? prop.collate.getStringValue().toUpperCase() : "DEFAULT");
+    builder.withCollations(collations);
     builder.withCallback((document, totalIndexed) -> {
       total.incrementAndGet();
       if (totalIndexed % 100000 == 0) {
@@ -171,10 +179,20 @@ public class CreateIndexStatement extends DDLStatement {
       final Map<String, Object> metadataMap = metadata.toMap((Result) null, context);
       final JSONObject jsonMetadata = new JSONObject(metadataMap);
 
+      // Extract buildGraphNow directive (default true) before passing metadata to builder
+      final boolean buildGraphNow = jsonMetadata.getBoolean("buildGraphNow", true);
+      jsonMetadata.remove("buildGraphNow");
+
       // Builder is now an LSMVectorIndexBuilder after withType(LSM_VECTOR)
       final TypeLSMVectorIndexBuilder vectorBuilder = builder.withLSMVectorType();
       vectorBuilder.withMetadata(jsonMetadata);
-      vectorBuilder.create();
+      final TypeIndex typeIndex = vectorBuilder.create();
+
+      // Build the HNSW graph immediately unless explicitly disabled
+      if (buildGraphNow)
+        for (final com.arcadedb.index.Index idx : typeIndex.getIndexesOnBuckets())
+          if (idx instanceof LSMVectorIndex)
+            ((LSMVectorIndex) idx).buildVectorGraphNow();
 
     } else if (indexType == Schema.INDEX_TYPE.FULL_TEXT && metadata != null) {
       // Handle full-text index metadata
@@ -253,18 +271,18 @@ public class CreateIndexStatement extends DDLStatement {
     builder.append(" ");
     type.toString(params, builder);
 
-    if (engine != null) {
-      builder.append(" ENGINE ");
-      engine.toString(params, builder);
+    // NULL_STRATEGY is only valid in the ON-clause form (typeName != null)
+    if (typeName != null && nullStrategy != null) {
+      builder.append(" NULL_STRATEGY ");
+      builder.append(nullStrategy);
     }
     if (metadata != null) {
       builder.append(" METADATA ");
       metadata.toString(params, builder);
     }
-
-    if (nullStrategy != null) {
-      builder.append(" NULL_STRATEGY ");
-      builder.append(nullStrategy);
+    if (engine != null) {
+      builder.append(" ENGINE ");
+      engine.toString(params, builder);
     }
     if (keyTypes != null && keyTypes.size() > 0) {
       boolean first = true;

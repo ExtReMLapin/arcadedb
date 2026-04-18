@@ -13,6 +13,9 @@ function renderGraph() {
   $("#settingNodeSize").val(globalGraphSettings.nodeSize || 25);
   $("#settingNodeSizeVal").text(globalGraphSettings.nodeSize || 25);
   $("#settingDefaultLabel").val(globalGraphSettings.defaultLabel != null ? globalGraphSettings.defaultLabel : "");
+  let maxLabelVal = globalGraphSettings.maxLabelLength || 45;
+  $("#settingMaxLabel").val(maxLabelVal);
+  $("#settingMaxLabelVal").text(maxLabelVal == 0 ? "off" : maxLabelVal);
 
   let elements = [];
   globalRenderedVerticesRID = {};
@@ -154,6 +157,70 @@ function renderGraph() {
   updateGraphStatus(warning);
 }
 
+/**
+ * Appends new query results to the existing graph (cumulative mode).
+ * Skips vertices/edges already present. Runs layout on new nodes only.
+ */
+function appendToGraph(newResult) {
+  if (globalCy == null || newResult == null) return;
+
+  var added = [];
+
+  for (var i in newResult.vertices) {
+    var vertex = newResult.vertices[i];
+    var rid = vertex["r"];
+    if (rid == null || globalRenderedVerticesRID[rid]) continue;
+
+    assignTypeColor(vertex.t);
+    assignProperties(vertex);
+
+    globalResultset.vertices.push(vertex);
+    globalRenderedVerticesRID[rid] = true;
+
+    var node = globalCy.add([{ group: "nodes", data: createVertex(vertex), classes: vertex["t"] }]);
+    added.push(node[0]);
+  }
+
+  for (var i in newResult.edges) {
+    var edge = newResult.edges[i];
+    if (!globalRenderedVerticesRID[edge.i] || !globalRenderedVerticesRID[edge.o]) continue;
+
+    // Skip if edge already in graph
+    if (edge.r && globalCy.getElementById(edge.r).length > 0) continue;
+
+    assignTypeColor(edge.t);
+    assignProperties(edge);
+
+    globalResultset.edges.push(edge);
+    globalCy.add([{ group: "edges", data: createEdge(edge), classes: edge["t"] }]);
+    ++globalTotalEdges;
+  }
+
+  // Merge records
+  if (newResult.records)
+    for (var i in newResult.records)
+      globalResultset.records.push(newResult.records[i]);
+
+  if (added.length > 0) {
+    // Run layout only on the new nodes so existing positions are preserved
+    var newCollection = globalCy.collection(added);
+    newCollection.layout({
+      name: "fcose",
+      animate: true,
+      animationDuration: 300,
+      nodeSeparation: globalGraphSettings.graphSpacing * 3,
+      idealEdgeLength: globalGraphSettings.graphSpacing * 3,
+      quality: "default",
+      randomize: true,
+      fit: false
+    }).run();
+
+    setGraphStyles();
+  }
+
+  updateGraphStatus(null);
+}
+
 function initGraph() {
   setGraphStyles();
 
@@ -213,6 +280,30 @@ function initGraph() {
     displaySelectedEdge();
   });
 
+  // Show full label tooltip on hover for truncated labels
+  let tooltipEl = null;
+  globalCy.on("mouseover", "node", function (event) {
+    let node = event.target;
+    let fullLabel = node.data("fullLabel");
+    let label = node.data("label");
+    if (fullLabel && fullLabel !== label) {
+      if (!tooltipEl) {
+        tooltipEl = document.createElement("div");
+        tooltipEl.style.cssText = "position:absolute;background:#333;color:#fff;padding:4px 8px;border-radius:4px;font-size:12px;max-width:400px;word-wrap:break-word;pointer-events:none;z-index:10000;";
+        document.body.appendChild(tooltipEl);
+      }
+      tooltipEl.textContent = fullLabel;
+      let pos = node.renderedPosition();
+      let container = globalCy.container().getBoundingClientRect();
+      tooltipEl.style.left = (container.left + pos.x + 10) + "px";
+      tooltipEl.style.top = (container.top + pos.y - 30) + "px";
+      tooltipEl.style.display = "block";
+    }
+  });
+  globalCy.on("mouseout", "node", function () {
+    if (tooltipEl) tooltipEl.style.display = "none";
+  });
+
   globalCy.layout(globalLayout).run();
 }
 
@@ -222,11 +313,13 @@ function createVertex(vertex) {
   getOrCreateStyleTypeAttrib(type, "element", "v");
 
   let label = resolveLabel(type, vertex["p"]);
+  let fullLabel = resolveFullLabel(type, vertex["p"]);
 
   let nodeSize = globalGraphSettings.nodeSize || 25;
-  let size = label.length > 0 ? nodeSize + 2 * label.length : nodeSize;
+  let maxAutoSize = nodeSize * 4;
+  let size = label.length > 0 ? Math.min(nodeSize + 2 * label.length, maxAutoSize) : nodeSize;
 
-  return { id: vertex["r"], label: label, size: size, type: type, weight: vertex["i"] + vertex["o"], properties: vertex["p"] };
+  return { id: vertex["r"], label: label, fullLabel: fullLabel, size: size, type: type, weight: vertex["i"] + vertex["o"], properties: vertex["p"] };
 }
 
 function createEdge(edge) {
@@ -250,6 +343,26 @@ function resolveLabel(type, properties) {
   if (labelProp.length == 0) return "";
 
   let label = properties[labelProp];
+  if (label == null) return "";
+
+  label = String(label);
+  let maxLen = globalGraphSettings.maxLabelLength || 45;
+  if (maxLen > 0 && label.length > maxLen)
+    label = label.substring(0, maxLen) + "...";
+  return label;
+}
+
+function resolveFullLabel(type, properties) {
+  let labelProp = getOrCreateStyleTypeAttrib(type, "labelText");
+  if (labelProp == null) {
+    let defaultLabel = globalGraphSettings.defaultLabel;
+    labelProp = defaultLabel != null ? defaultLabel : "";
+  }
+
+  if (labelProp == "@type") return type;
+  if (labelProp.length == 0) return "";
+
+  let label = properties[labelProp];
   return label != null ? String(label) : "";
 }
 
@@ -257,30 +370,34 @@ function updateLabelsForType(type) {
   if (globalCy == null) return;
 
   let nodeSize = globalGraphSettings.nodeSize || 25;
+  let maxAutoSize = nodeSize * 4;
   let isEdge = getOrCreateStyleTypeAttrib(type, "element") === "e";
 
   globalCy.elements("." + type).forEach(function (ele) {
     let props = ele.data("properties");
     let label = resolveLabel(type, props || {});
+    let fullLabel = resolveFullLabel(type, props || {});
     ele.data("label", label);
+    ele.data("fullLabel", fullLabel);
     if (!isEdge)
-      ele.data("size", label.length > 0 ? nodeSize + 2 * label.length : nodeSize);
+      ele.data("size", label.length > 0 ? Math.min(nodeSize + 2 * label.length, maxAutoSize) : nodeSize);
   });
 }
 
 function assignTypeColor(type) {
+  // Preserve any color already set (either default or user override).
+  if (getOrCreateStyleTypeAttrib(type, "shapeColor") != null) return;
+
   let sidebarColor = typeof globalSidebarTypeColors !== "undefined" ? globalSidebarTypeColors[type] : null;
   if (sidebarColor != null) {
     getOrCreateStyleTypeAttrib(type, "shapeColor", sidebarColor);
-    getOrCreateStyleTypeAttrib(type, "labelColor", "white");
+    if (getOrCreateStyleTypeAttrib(type, "labelColor") == null)
+      getOrCreateStyleTypeAttrib(type, "labelColor", "white");
   } else {
-    let color = getOrCreateStyleTypeAttrib(type, "shapeColor");
-    if (color == null) {
-      if (globalLastColorIndex >= globalBgColors.length) globalLastColorIndex = 0;
-      getOrCreateStyleTypeAttrib(type, "labelColor", globalFgColors[globalLastColorIndex]);
-      getOrCreateStyleTypeAttrib(type, "shapeColor", globalBgColors[globalLastColorIndex]);
-      ++globalLastColorIndex;
-    }
+    if (globalLastColorIndex >= globalBgColors.length) globalLastColorIndex = 0;
+    getOrCreateStyleTypeAttrib(type, "labelColor", globalFgColors[globalLastColorIndex]);
+    getOrCreateStyleTypeAttrib(type, "shapeColor", globalBgColors[globalLastColorIndex]);
+    ++globalLastColorIndex;
   }
 }
 
@@ -607,7 +724,8 @@ function saveGraphGlobalSettings() {
     nodeSize: globalGraphSettings.nodeSize,
     defaultLabel: globalGraphSettings.defaultLabel,
     graphSpacing: globalGraphSettings.graphSpacing,
-    cumulativeSelection: globalGraphSettings.cumulativeSelection
+    cumulativeSelection: globalGraphSettings.cumulativeSelection,
+    maxLabelLength: globalGraphSettings.maxLabelLength
   }));
 }
 
@@ -620,6 +738,7 @@ function loadGraphTypeStyles() {
       if (parsed.defaultLabel != null) globalGraphSettings.defaultLabel = parsed.defaultLabel;
       if (parsed.graphSpacing != null) globalGraphSettings.graphSpacing = parsed.graphSpacing;
       if (parsed.cumulativeSelection != null) globalGraphSettings.cumulativeSelection = parsed.cumulativeSelection;
+      if (parsed.maxLabelLength != null) globalGraphSettings.maxLabelLength = parsed.maxLabelLength;
     } catch (e) { /* ignore corrupt data */ }
   }
 

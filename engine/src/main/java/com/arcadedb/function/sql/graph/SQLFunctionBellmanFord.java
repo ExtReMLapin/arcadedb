@@ -21,8 +21,11 @@ package com.arcadedb.function.sql.graph;
 import com.arcadedb.database.Database;
 import com.arcadedb.database.Identifiable;
 import com.arcadedb.database.Record;
+import com.arcadedb.function.sql.FunctionOptions;
 import com.arcadedb.function.sql.math.SQLFunctionMathAbstract;
 import com.arcadedb.graph.Edge;
+import com.arcadedb.graph.GraphTraversalProvider;
+import com.arcadedb.graph.GraphTraversalProviderRegistry;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.schema.DocumentType;
@@ -55,6 +58,8 @@ import java.util.Set;
 public class SQLFunctionBellmanFord extends SQLFunctionMathAbstract {
   public static final String NAME = "bellmanFord";
 
+  private static final Set<String> OPTIONS = Set.of("direction");
+
   public SQLFunctionBellmanFord() {
     super(NAME);
   }
@@ -68,7 +73,7 @@ public class SQLFunctionBellmanFord extends SQLFunctionMathAbstract {
     final Vertex sourceVertex = toVertex(params[0], context);
     final Vertex destVertex = toVertex(params[1], context);
     final String weightProperty = FileUtils.getStringContent(params[2]);
-    final String direction = params.length > 3 ? params[3].toString().toUpperCase() : "BOTH";
+    final String direction = parseDirectionParam(params);
 
     if (sourceVertex == null || destVertex == null)
       return new LinkedList<>();
@@ -95,13 +100,49 @@ public class SQLFunctionBellmanFord extends SQLFunctionMathAbstract {
     Arrays.fill(prev, -1);
     dist[startIdx] = 0.0;
 
-    // Collect all edges based on direction
+    // Collect all edges based on direction — use CSR + edge properties when available
     final List<int[]> edgeList = new ArrayList<>();
     final List<Double> edgeWeights = new ArrayList<>();
+    final Vertex.DIRECTION dir = parseDirection(direction);
+
+    final GraphTraversalProvider provider = GraphTraversalProviderRegistry.findProvider(db);
+    final boolean useCSR = provider != null && provider.hasEdgeProperties();
 
     for (int i = 0; i < n; i++) {
       final Vertex v = vertices.get(i);
-      final Vertex.DIRECTION dir = parseDirection(direction);
+
+      if (useCSR) {
+        final int nodeId = provider.getNodeId(v.getIdentity());
+        if (nodeId >= 0) {
+          final int[] neighborIds = provider.getNeighborIds(nodeId, dir);
+          for (int ni = 0; ni < neighborIds.length; ni++) {
+            final var neighborRid = provider.getRID(neighborIds[ni]);
+            if (neighborRid == null)
+              continue;
+            // Find vertex index — look up by RID in the map
+            final Vertex neighborVertex;
+            try {
+              neighborVertex = neighborRid.asVertex();
+            } catch (final Exception e) {
+              continue;
+            }
+            final Integer j = vertexIndex.get(neighborVertex);
+            if (j == null)
+              continue;
+            double w = 1.0;
+            if (weightProperty != null && !weightProperty.isEmpty()) {
+              final Object wObj = provider.getEdgeProperty(nodeId, ni, dir, null, weightProperty);
+              if (wObj instanceof Number num)
+                w = num.doubleValue();
+            }
+            edgeList.add(new int[] { i, j });
+            edgeWeights.add(w);
+          }
+          continue;
+        }
+      }
+
+      // OLTP fallback
       for (final Edge edge : v.getEdges(dir)) {
         final Vertex neighbor;
         if (dir == Vertex.DIRECTION.OUT)
@@ -198,8 +239,22 @@ public class SQLFunctionBellmanFord extends SQLFunctionMathAbstract {
     };
   }
 
+  /**
+   * The 4th positional param accepts either the direction string (back-compat) or an options map.
+   */
+  private String parseDirectionParam(final Object[] params) {
+    if (params.length <= 3 || params[3] == null)
+      return "BOTH";
+    if (params[3] instanceof Map<?, ?> rawMap) {
+      final FunctionOptions opts = new FunctionOptions(NAME, rawMap, OPTIONS);
+      return opts.getString("direction", "BOTH").toUpperCase();
+    }
+    return params[3].toString().toUpperCase();
+  }
+
   @Override
   public String getSyntax() {
-    return "bellmanFord(<sourceVertex>, <destinationVertex>, <weightEdgeFieldName> [, <direction>])";
+    return "bellmanFord(<sourceVertex>, <destinationVertex>, <weightEdgeFieldName>"
+        + " [, <direction> | { direction }])";
   }
 }

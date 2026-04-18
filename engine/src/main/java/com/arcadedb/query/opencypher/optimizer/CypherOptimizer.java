@@ -23,7 +23,9 @@ import com.arcadedb.graph.GraphTraversalProvider;
 import com.arcadedb.graph.GraphTraversalProviderRegistry;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.opencypher.ast.BooleanExpression;
+import com.arcadedb.query.opencypher.ast.Expression;
 import com.arcadedb.query.opencypher.ast.CypherStatement;
+import com.arcadedb.query.opencypher.ast.MatchClause;
 import com.arcadedb.query.opencypher.ast.Direction;
 import com.arcadedb.query.opencypher.ast.WhereClause;
 import com.arcadedb.query.opencypher.executor.operators.CartesianProduct;
@@ -32,15 +34,18 @@ import com.arcadedb.query.opencypher.executor.operators.ExpandInto;
 import com.arcadedb.query.opencypher.executor.operators.FilterOperator;
 import com.arcadedb.query.opencypher.executor.operators.GAVExpandAll;
 import com.arcadedb.query.opencypher.executor.operators.GAVExpandInto;
+import com.arcadedb.query.opencypher.executor.operators.GAVFusedChainOperator;
 import com.arcadedb.query.opencypher.executor.operators.PhysicalOperator;
 import com.arcadedb.query.opencypher.optimizer.plan.*;
 import com.arcadedb.query.opencypher.optimizer.rules.*;
 import com.arcadedb.query.opencypher.optimizer.statistics.CostModel;
 import com.arcadedb.query.opencypher.optimizer.statistics.StatisticsProvider;
+import com.arcadedb.schema.EdgeType;
 import com.arcadedb.query.sql.executor.CommandContext;
 import com.arcadedb.query.sql.executor.Result;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -127,7 +132,14 @@ public class CypherOptimizer {
     }
 
     // 3. Select anchor node (best starting point)
-    final AnchorSelection anchor = anchorSelector.selectAnchor(logicalPlan);
+    AnchorSelection anchor = anchorSelector.selectAnchor(logicalPlan);
+
+    // 3a. Validate anchor against UNIDIRECTIONAL edge constraints.
+    // UNIDIRECTIONAL edges only store outgoing links on the source vertex,
+    // so reverse traversal (incoming from target) finds nothing. If the selected
+    // anchor would force reverse traversal of a UNIDIRECTIONAL edge, re-select
+    // the source side as anchor instead.
+    anchor = validateAnchorForUnidirectionalEdges(anchor, logicalPlan);
 
     // 4. Create anchor operator (index seek or scan)
     final PhysicalOperator anchorOperator = createAnchorOperator(anchor);
@@ -147,11 +159,18 @@ public class CypherOptimizer {
       rootOperator = applyFilterPushdown(logicalPlan, rootOperator);
     }
 
-    // 8. Calculate total cost and cardinality
+    // 8. Fuse consecutive GAVExpandAll operators into a single GAVFusedChainOperator
+    // This eliminates ALL intermediate ResultInternal/HashMap/Vertex allocations
+    rootOperator = fuseGAVExpandChain(rootOperator);
+
+    // 9. Defer vertex loading for remaining (non-fused) intermediate GAVExpandAll hops
+    applyDeferredVertexLoading(rootOperator);
+
+    // 10. Calculate total cost and cardinality
     final double totalCost = rootOperator.getEstimatedCost();
     final long totalCardinality = rootOperator.getEstimatedCardinality();
 
-    // 9. Build physical plan with complete operator tree
+    // 11. Build physical plan with complete operator tree
     return new PhysicalPlan(logicalPlan, anchor, rootOperator, totalCost, totalCardinality);
   }
 
@@ -231,6 +250,40 @@ public class CypherOptimizer {
     });
 
     return typeNames;
+  }
+
+  /**
+   * Validates the selected anchor against UNIDIRECTIONAL edge constraints.
+   * If the anchor is on the target side of a directed UNIDIRECTIONAL edge,
+   * the expand operator would need to traverse incoming edges which don't exist.
+   * In that case, force the source side as the anchor instead.
+   */
+  private AnchorSelection validateAnchorForUnidirectionalEdges(final AnchorSelection anchor,
+      final LogicalPlan logicalPlan) {
+    final String anchorVar = anchor.getVariable();
+    final var schema = database.getSchema();
+
+    for (final LogicalRelationship rel : logicalPlan.getRelationships()) {
+      // Check if the anchor is the target of an OUT relationship (would need IN traversal)
+      // or the source of an IN relationship (would need OUT traversal from the other side)
+      final boolean anchorIsTarget = anchorVar.equals(rel.getTargetVariable()) && rel.getDirection() == Direction.OUT;
+      final boolean anchorIsSource = anchorVar.equals(rel.getSourceVariable()) && rel.getDirection() == Direction.IN;
+
+      if (anchorIsTarget || anchorIsSource) {
+        // Check if any edge type in this relationship is UNIDIRECTIONAL
+        for (final String edgeTypeName : rel.getTypes()) {
+          if (schema.existsType(edgeTypeName) && schema.getType(edgeTypeName) instanceof EdgeType et && !et.isBidirectional()) {
+            // Force the other side as the anchor
+            final String correctAnchorVar = anchorIsTarget ? rel.getSourceVariable() : rel.getTargetVariable();
+            final LogicalNode correctNode = logicalPlan.getNodes().get(correctAnchorVar);
+            if (correctNode != null)
+              return anchorSelector.evaluateNodeDirect(correctNode, logicalPlan);
+            break;
+          }
+        }
+      }
+    }
+    return anchor;
   }
 
   /**
@@ -322,14 +375,26 @@ public class CypherOptimizer {
     final boolean targetIsBound = boundVariables.contains(targetVariable);
 
     if (targetIsBound && !sourceIsBound) {
-      // Anchor is the target, need to reverse direction
-      // Swap source and target
-      final String temp = sourceVariable;
-      sourceVariable = targetVariable;
-      targetVariable = temp;
-
-      // Reverse direction
-      direction = reverseDirection(direction);
+      // Anchor is the target, need to reverse direction.
+      // However, unidirectional edges don't store incoming links, so reverse traversal
+      // (IN direction) at a vertex returns nothing. For unidirectional edges, skip the swap
+      // and use ExpandInto semantics instead (the downstream ExpandIntoRule will handle it).
+      boolean canReverse = true;
+      for (final String et : edgeTypes)
+        if (database.getSchema().existsType(et)
+            && database.getSchema().getType(et) instanceof EdgeType edgeType
+            && !edgeType.isBidirectional()) {
+          canReverse = false;
+          break;
+        }
+      if (canReverse) {
+        // Swap source and target
+        final String temp = sourceVariable;
+        sourceVariable = targetVariable;
+        targetVariable = temp;
+        // Reverse direction
+        direction = reverseDirection(direction);
+      }
     }
 
     // Estimate cost and cardinality for this expansion
@@ -465,6 +530,178 @@ public class CypherOptimizer {
   }
 
   /**
+   * Detects chains of consecutive GAVExpandAll operators and fuses them into a single
+   * GAVFusedChainOperator. This eliminates ALL intermediate ResultInternal allocations
+   * (HashMap, Vertex objects) during multi-hop traversal — the chain runs entirely
+   * with int nodeIds from CSR arrays.
+   * <p>
+   * Requires at least 2 consecutive GAVExpandAll operators sharing the same provider.
+   */
+  private PhysicalOperator fuseGAVExpandChain(PhysicalOperator rootOperator) {
+    // Walk from root down to collect the GAVExpandAll chain
+    final List<GAVExpandAll> chain = new ArrayList<>();
+    PhysicalOperator current = rootOperator;
+
+    // Skip filters at the top (they sit above the expand chain)
+    PhysicalOperator topFilter = null;
+    if (current instanceof FilterOperator) {
+      topFilter = current;
+      current = ((FilterOperator) current).getChild();
+    }
+
+    while (current instanceof GAVExpandAll) {
+      chain.add((GAVExpandAll) current);
+      current = current.getChild();
+    }
+
+    // Need at least 2 GAVExpandAll for fusion to be worthwhile
+    if (chain.size() < 2)
+      return rootOperator;
+
+    // Verify all use the same provider
+    final GraphTraversalProvider provider = chain.get(0).getProvider();
+    for (int i = 1; i < chain.size(); i++)
+      if (chain.get(i).getProvider() != provider)
+        return rootOperator;
+
+    // chain[0] is the outermost (root), chain[last] is the innermost (closest to scan)
+    // Reverse to get traversal order: innermost first
+    final int chainLen = chain.size();
+
+    // Verify the chain is LINEAR: each hop's source must be the previous hop's target.
+    // The fused chain operator uses a stack where stackNodeId[depth] is the source for hop[depth],
+    // which is the target of hop[depth-1]. If the JoinOrderRule reorders hops such that multiple
+    // hops expand from the same node (branching), the fused chain would incorrectly use the
+    // previous hop's target as the source instead of the actual source variable.
+    {
+      String expectedSource = chain.get(chainLen - 1).getSourceVariable(); // innermost source
+      for (int i = chainLen - 1; i >= 0; i--) {
+        final GAVExpandAll gav = chain.get(i);
+        if (!expectedSource.equals(gav.getSourceVariable()))
+          return rootOperator; // Non-linear chain — bail out
+        expectedSource = gav.getTargetVariable();
+      }
+    }
+
+    // Build hop arrays (in traversal order: innermost → outermost)
+    final Vertex.DIRECTION[] hopDirs = new Vertex.DIRECTION[chainLen];
+    final String[][] hopEdgeTypes = new String[chainLen][];
+    final String[] hopTargetVars = new String[chainLen];
+    final int[][] hopTargetBuckets = new int[chainLen][];
+
+    for (int i = 0; i < chainLen; i++) {
+      final GAVExpandAll gav = chain.get(chainLen - 1 - i); // reverse order
+      hopDirs[i] = gav.getDirection().toArcadeDirection();
+      hopEdgeTypes[i] = gav.getEdgeTypes();
+      hopTargetVars[i] = gav.getTargetVariable();
+
+      // Resolve target label to bucket IDs for fast filtering
+      final String targetLabel = gav.getTargetLabel();
+      if (targetLabel != null && database.getSchema().existsType(targetLabel)) {
+        final var buckets = database.getSchema().getType(targetLabel).getBuckets(false);
+        final int[] ids = new int[buckets.size()];
+        for (int b = 0; b < buckets.size(); b++)
+          ids[b] = buckets.get(b).getFileId();
+        hopTargetBuckets[i] = ids;
+      }
+    }
+
+    // Source variable = innermost GAVExpandAll's source variable
+    final String sourceVar = chain.get(chainLen - 1).getSourceVariable();
+
+    // Determine which variables need materialization (referenced in WHERE/WITH/RETURN)
+    final Set<String> usedVariables = new HashSet<>();
+    if (statement.getWhereClause() != null && statement.getWhereClause().getConditionExpression() != null)
+      usedVariables.addAll(WhereClause.collectVariables(statement.getWhereClause().getConditionExpression()));
+    for (final MatchClause mc : statement.getMatchClauses())
+      if (mc.hasWhereClause() && mc.getWhereClause().getConditionExpression() != null)
+        usedVariables.addAll(WhereClause.collectVariables(mc.getWhereClause().getConditionExpression()));
+    if (statement.getReturnClause() != null)
+      for (final var item : statement.getReturnClause().getReturnItems())
+        collectExpressionVariables(item.getExpression(), usedVariables);
+    for (final var wc : statement.getWithClauses())
+      for (final var item : wc.getItems())
+        collectExpressionVariables(item.getExpression(), usedVariables);
+
+    final boolean[] materialize = new boolean[chainLen + 1];
+    materialize[0] = usedVariables.contains(sourceVar); // source
+    for (int i = 0; i < chainLen; i++)
+      materialize[i + 1] = hopTargetVars[i] != null && usedVariables.contains(hopTargetVars[i]);
+
+    // The child of the innermost GAVExpandAll is the data source (e.g., NodeByLabelScan)
+    final PhysicalOperator dataSource = current;
+
+    final GAVFusedChainOperator fused = new GAVFusedChainOperator(
+        dataSource, provider, sourceVar,
+        hopDirs, hopEdgeTypes, hopTargetVars, hopTargetBuckets, materialize,
+        rootOperator.getEstimatedCost() * 0.5, // fusion is cheaper
+        rootOperator.getEstimatedCardinality());
+
+    // Push filter INTO the fused chain (evaluated via column store, before creating output objects)
+    if (topFilter instanceof FilterOperator) {
+      fused.setPushedFilter(((FilterOperator) topFilter).getPredicate());
+      // No need for a separate FilterOperator on top — the fused chain handles it
+    }
+    return fused;
+  }
+
+  /**
+   * Marks intermediate GAVExpandAll operators for deferred vertex loading.
+   * A variable is "intermediate" if it is not referenced in any WHERE, WITH, or RETURN expression —
+   * it only serves as a stepping stone for further traversal.
+   * Skipping the OLTP vertex load for these variables can save ~2μs per row.
+   */
+  private void applyDeferredVertexLoading(final PhysicalOperator rootOperator) {
+    // Collect variables referenced in WHERE/WITH/RETURN expressions
+    final Set<String> usedVariables = new HashSet<>();
+    // From WHERE
+    if (statement.getWhereClause() != null && statement.getWhereClause().getConditionExpression() != null)
+      usedVariables.addAll(WhereClause.collectVariables(statement.getWhereClause().getConditionExpression()));
+    for (final MatchClause mc : statement.getMatchClauses())
+      if (mc.hasWhereClause() && mc.getWhereClause().getConditionExpression() != null)
+        usedVariables.addAll(WhereClause.collectVariables(mc.getWhereClause().getConditionExpression()));
+    // From RETURN
+    if (statement.getReturnClause() != null)
+      for (final var item : statement.getReturnClause().getReturnItems())
+        collectExpressionVariables(item.getExpression(), usedVariables);
+    // From WITH
+    for (final var wc : statement.getWithClauses())
+      for (final var item : wc.getItems())
+        collectExpressionVariables(item.getExpression(), usedVariables);
+
+    // Walk the operator tree and mark GAVExpandAll operators for deferred loading
+    // The root operator's target should NOT be deferred (it's the final output)
+    markDeferredRecursive(rootOperator, usedVariables, true);
+  }
+
+  private void markDeferredRecursive(final PhysicalOperator op, final Set<String> usedVariables, final boolean isRoot) {
+    if (op instanceof GAVExpandAll) {
+      final GAVExpandAll gav = (GAVExpandAll) op;
+      if (!isRoot) {
+        final String targetVar = gav.getTargetVariable();
+        if (targetVar != null && !usedVariables.contains(targetVar))
+          gav.setDeferTargetLoad(true);
+      }
+      if (gav.getChild() != null)
+        markDeferredRecursive(gav.getChild(), usedVariables, false);
+    } else if (op instanceof FilterOperator) {
+      if (((FilterOperator) op).getChild() != null)
+        markDeferredRecursive(((FilterOperator) op).getChild(), usedVariables, false);
+    }
+  }
+
+  private static void collectExpressionVariables(final Expression expr, final Set<String> vars) {
+    final String text = expr.getText();
+    // Extract variable references: "var.prop" → "var", bare "var" → "var"
+    for (final String token : text.split("[^a-zA-Z0-9_.]")) {
+      if (!token.isEmpty()) {
+        final int dot = token.indexOf('.');
+        vars.add(dot >= 0 ? token.substring(0, dot) : token);
+      }
+    }
+  }
+
+  /**
    * Adds a label filter for the target vertex if the logical plan specifies a label.
    * This ensures that after relationship expansion, we only keep vertices of the correct type.
    *
@@ -476,32 +713,47 @@ public class CypherOptimizer {
   private PhysicalOperator addTargetLabelFilter(final LogicalPlan logicalPlan,
                                                  final LogicalRelationship rel,
                                                  final PhysicalOperator input) {
-    // Get the target variable
-    final String targetVariable = rel.getTargetVariable();
+    // Determine the actual expand target variable (may differ from rel.getTargetVariable()
+    // when the optimizer reverses traversal direction)
+    final String expandTargetVariable;
+    if (input instanceof GAVExpandAll)
+      expandTargetVariable = ((GAVExpandAll) input).getTargetVariable();
+    else if (input instanceof ExpandAll)
+      expandTargetVariable = ((ExpandAll) input).getTargetVariable();
+    else
+      expandTargetVariable = rel.getTargetVariable();
 
-    // Look up the LogicalNode for the target variable
+    // Look up the LogicalNode for the expand target variable
     final LogicalNode targetNode =
-        logicalPlan.getNodes().get(targetVariable);
+        logicalPlan.getNodes().get(expandTargetVariable);
 
-    if (targetNode == null || !targetNode.hasLabels()) {
-      // No label to filter on, return input unchanged
+    if (targetNode == null || !targetNode.hasLabels())
       return input;
-    }
 
     // Get the first label (for now we only support single labels)
     final String targetLabel = targetNode.getFirstLabel();
 
-    if (targetLabel == null) {
+    if (targetLabel == null)
+      return input;
+
+    // Push label filter directly into the expand operator for early filtering
+    // instead of wrapping with a separate FilterOperator (avoids materializing
+    // rows that will be immediately discarded)
+    if (input instanceof GAVExpandAll) {
+      ((GAVExpandAll) input).setTargetLabel(targetLabel);
+      return input;
+    }
+    if (input instanceof ExpandAll) {
+      ((ExpandAll) input).setTargetLabel(targetLabel);
       return input;
     }
 
-    // Create a label filter expression: vertex.getTypeName() == targetLabel
-    // We create a custom BooleanExpression that checks the vertex type
+    // Fallback: wrap with FilterOperator for other operator types
     final BooleanExpression labelFilter = new BooleanExpression() {
       @Override
       public boolean evaluate(final Result result,
                               final CommandContext context) {
-        final Object vertexObj = result.getProperty(targetVariable);
+        final Object vertexObj = result.getProperty(expandTargetVariable);
         if (vertexObj instanceof Vertex) {
           final Vertex vertex = (Vertex) vertexObj;
           return vertex.getType().instanceOf(targetLabel);
@@ -511,23 +763,19 @@ public class CypherOptimizer {
 
       @Override
       public String getText() {
-        return "labels(" + targetVariable + ") = ['" + targetLabel + "']";
+        return "labels(" + expandTargetVariable + ") = ['" + targetLabel + "']";
       }
     };
 
-    // Estimate cost and cardinality for this filter
     final long inputCardinality = input.getEstimatedCardinality();
-    final double selectivity = 1.0; // Assume most expanded vertices match the type (optimistic)
-    final long outputCardinality = (long) (inputCardinality * selectivity);
     final double filterCost = inputCardinality * costModel.FILTER_COST_PER_ROW;
     final double totalCost = input.getEstimatedCost() + filterCost;
 
-    // Wrap with FilterOperator
     return new FilterOperator(
         input,
         labelFilter,
         totalCost,
-        outputCardinality
+        inputCardinality
     );
   }
 

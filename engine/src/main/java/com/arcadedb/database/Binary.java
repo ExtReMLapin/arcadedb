@@ -392,6 +392,7 @@ public class Binary implements BinaryStructure, Comparable<Binary> {
 
   @Override
   public long getUnsignedNumber() {
+    final int startPos = buffer.position();
     long value = 0L;
     int i = 0;
     long b;
@@ -399,7 +400,8 @@ public class Binary implements BinaryStructure, Comparable<Binary> {
       value |= (b & 0x7F) << i;
       i += 7;
       if (i > 63)
-        throw new IllegalArgumentException("Variable length quantity is too long (must be <= 63)");
+        throw new IllegalArgumentException(
+            "Variable length quantity is too long (must be <= 63) at position " + startPos + " in buffer of size " + size);
     }
     return value | (b << i);
   }
@@ -411,6 +413,7 @@ public class Binary implements BinaryStructure, Comparable<Binary> {
    */
   @Override
   public long[] getUnsignedNumberAndSize() {
+    final int startPos = buffer.position();
     long value = 0L;
     int i = 0;
     long b;
@@ -419,7 +422,8 @@ public class Binary implements BinaryStructure, Comparable<Binary> {
       value |= (b & 0x7F) << i;
       i += 7;
       if (i > 63)
-        throw new IllegalArgumentException("Variable length (" + i + ") quantity is too long (must be <= 63)");
+        throw new IllegalArgumentException(
+            "Variable length quantity is too long (must be <= 63) at position " + startPos + " in buffer of size " + size);
       ++byteRead;
     }
     return new long[] { value | (b << i), byteRead };
@@ -610,6 +614,10 @@ public class Binary implements BinaryStructure, Comparable<Binary> {
   public void move(final int startPosition, final int destPosition, final int length) {
     if (length == 0)
       return;
+    if (length < 0)
+      throw new IllegalArgumentException(
+          "Cannot move a negative number of bytes (startPosition=" + startPosition + " destPosition=" + destPosition + " length="
+              + length + " bufferSize=" + size + ")");
     checkForAllocation(0, destPosition + length);
     System.arraycopy(content, buffer.arrayOffset() + startPosition, content, buffer.arrayOffset() + destPosition, length);
   }

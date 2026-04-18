@@ -44,6 +44,7 @@ public class LocalTimeSeriesType extends LocalDocumentType {
   public static final String KIND_CODE = "t";
 
   private String                       timestampColumn;
+  private String                       precision;
   private int                          shardCount;
   private long                         retentionMs;
   private long                         compactionBucketIntervalMs;
@@ -83,12 +84,35 @@ public class LocalTimeSeriesType extends LocalDocumentType {
     }
   }
 
+  /**
+   * Drops this timeseries type: deletes all shard data files (mutable bucket and sealed store)
+   * from disk and shuts down the engine.
+   */
+  public void drop() {
+    if (engine != null) {
+      try {
+        engine.drop();
+      } catch (final IOException e) {
+        LogManager.instance().log(this, Level.WARNING, "Error dropping TimeSeriesEngine for type '%s': %s", e, name, e.getMessage());
+      }
+      engine = null;
+    }
+  }
+
   public String getTimestampColumn() {
     return timestampColumn;
   }
 
   public void setTimestampColumn(final String timestampColumn) {
     this.timestampColumn = timestampColumn;
+  }
+
+  public String getPrecision() {
+    return precision;
+  }
+
+  public void setPrecision(final String precision) {
+    this.precision = precision;
   }
 
   public int getShardCount() {
@@ -139,6 +163,8 @@ public class LocalTimeSeriesType extends LocalDocumentType {
 
     // TimeSeries-specific fields
     json.put("timestampColumn", timestampColumn);
+    if (precision != null)
+      json.put("precision", precision);
     json.put("shardCount", shardCount);
     json.put("retentionMs", retentionMs);
     if (compactionBucketIntervalMs > 0)
@@ -175,6 +201,7 @@ public class LocalTimeSeriesType extends LocalDocumentType {
    */
   public void fromJSON(final JSONObject json) {
     timestampColumn = json.getString("timestampColumn", null);
+    precision = json.getString("precision", null);
     shardCount = json.getInt("shardCount", 1);
     retentionMs = json.getLong("retentionMs", 0L);
     compactionBucketIntervalMs = json.getLong("compactionBucketIntervalMs", 0L);

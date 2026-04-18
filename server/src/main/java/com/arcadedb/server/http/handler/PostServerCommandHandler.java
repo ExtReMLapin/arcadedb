@@ -46,14 +46,17 @@ import com.arcadedb.server.security.ServerSecurityUser;
 import com.arcadedb.utility.FileUtils;
 import io.micrometer.core.instrument.Metrics;
 import io.undertow.server.HttpServerExchange;
+import io.undertow.util.HttpString;
 import io.undertow.util.StatusCodes;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.rmi.*;
 import java.time.*;
 import java.time.format.*;
 import java.util.*;
+import java.util.concurrent.atomic.*;
 import java.util.regex.*;
 
 public class PostServerCommandHandler extends AbstractServerHttpHandler {
@@ -75,6 +78,8 @@ public class PostServerCommandHandler extends AbstractServerHttpHandler {
   private static final String SET_BACKUP_CONFIG    = "set backup config";
   private static final String LIST_BACKUPS         = "list backups";
   private static final String TRIGGER_BACKUP       = "trigger backup";
+  private static final String RESTORE_DATABASE     = "restore database";
+  private static final String IMPORT_DATABASE      = "import database";
   private static final String PROFILER             = "profiler";
 
   public PostServerCommandHandler(final HttpServer httpServer) {
@@ -138,6 +143,10 @@ public class PostServerCommandHandler extends AbstractServerHttpHandler {
       return listBackups(extractTarget(command, LIST_BACKUPS));
     else if (command_lc.startsWith(TRIGGER_BACKUP))
       return triggerBackup(extractTarget(command, TRIGGER_BACKUP));
+    else if (command_lc.startsWith(RESTORE_DATABASE))
+      return restoreDatabase(extractTarget(command, RESTORE_DATABASE), exchange);
+    else if (command_lc.startsWith(IMPORT_DATABASE))
+      return importDatabase(extractTarget(command, IMPORT_DATABASE), exchange);
     else if (command_lc.startsWith(PROFILER))
       return handleProfilerCommand(extractTarget(command, PROFILER));
     else {
@@ -211,6 +220,213 @@ public class PostServerCommandHandler extends AbstractServerHttpHandler {
       final ReplicatedDatabase replicatedDatabase = (ReplicatedDatabase) db.getWrappedDatabaseInstance();
       replicatedDatabase.createInReplicas();
     }
+  }
+
+  /**
+   * Restores a database from a backup URL. Format: {@code restore database <name> <url>}.
+   * Supports SSE progress streaming when the client sends {@code Accept: text/event-stream}.
+   */
+  private ExecutionResponse restoreDatabase(final String args, final HttpServerExchange exchange) {
+    final int space = args.indexOf(' ');
+    if (space <= 0)
+      throw new IllegalArgumentException("Usage: restore database <name> <url>");
+
+    final String databaseName = args.substring(0, space).trim();
+    final String url = args.substring(space + 1).trim();
+
+    if (databaseName.isEmpty() || url.isEmpty())
+      throw new IllegalArgumentException("Usage: restore database <name> <url>");
+
+    checkServerIsLeaderIfInHA();
+
+    final ArcadeDBServer server = httpServer.getServer();
+    Metrics.counter("http.restore-database").increment();
+
+    final String dbPath = server.getConfiguration().getValueAsString(GlobalConfiguration.SERVER_DATABASE_DIRECTORY)
+        + File.separator + databaseName;
+
+    if (new File(dbPath).exists())
+      throw new IllegalArgumentException("Database '" + databaseName + "' already exists");
+
+    if (isSSERequested(exchange)) {
+      startSSE(exchange);
+      final OutputStream out = exchange.getOutputStream();
+
+      try {
+        final Class<?> clazz = Class.forName("com.arcadedb.integration.restore.Restore");
+        final Object restorer = clazz.getConstructor(String.class, String.class).newInstance(url, dbPath);
+
+        // Set a logger with SSE callback for progress
+        final Class<?> loggerClass = Class.forName("com.arcadedb.integration.importer.ConsoleLogger");
+        final Class<?> listenerClass = Class.forName("com.arcadedb.integration.importer.ConsoleLogger$LogListener");
+        final Object listener = java.lang.reflect.Proxy.newProxyInstance(
+            listenerClass.getClassLoader(), new Class<?>[]{ listenerClass },
+            (proxy, method, methodArgs) -> {
+              if ("onLogLine".equals(method.getName()))
+                sendSSE(out, new JSONObject().put("status", "progress").put("message", (String) methodArgs[0]));
+              return null;
+            });
+        final Object logger = loggerClass.getConstructor(int.class, listenerClass).newInstance(2, listener);
+        clazz.getMethod("setLogger", loggerClass).invoke(restorer, logger);
+
+        sendSSE(out, new JSONObject().put("status", "progress").put("message", "Downloading and restoring " + databaseName + "..."));
+        clazz.getMethod("restoreDatabase").invoke(restorer);
+        server.getDatabase(databaseName);
+        sendSSE(out, new JSONObject().put("status", "completed").put("message", databaseName + " restored successfully"));
+      } catch (final Exception e) {
+        final Throwable cause = e instanceof java.lang.reflect.InvocationTargetException ? e.getCause() : e;
+        sendSSE(out, new JSONObject().put("status", "error").put("message", cause.getMessage()));
+      } finally {
+        closeSSE(out);
+      }
+      return null; // response already sent via SSE
+    }
+
+    // Synchronous fallback (no SSE)
+    try {
+      final Class<?> clazz = Class.forName("com.arcadedb.integration.restore.Restore");
+      final Object restorer = clazz.getConstructor(String.class, String.class).newInstance(url, dbPath);
+      clazz.getMethod("restoreDatabase").invoke(restorer);
+    } catch (final ClassNotFoundException | NoSuchMethodException | IllegalAccessException
+                   | InstantiationException e) {
+      throw new CommandExecutionException("Restore libs not found in classpath", e);
+    } catch (final java.lang.reflect.InvocationTargetException e) {
+      throw new CommandExecutionException("Error restoring database", e.getTargetException());
+    }
+
+    server.getDatabase(databaseName);
+    return new ExecutionResponse(200, new JSONObject().put("result", "ok").toString());
+  }
+
+  /**
+   * Creates and imports a database in one step. Format: {@code import database <name> <url>}.
+   * Supports SSE progress streaming when the client sends {@code Accept: text/event-stream}.
+   */
+  private ExecutionResponse importDatabase(final String args, final HttpServerExchange exchange) {
+    final int space = args.indexOf(' ');
+    if (space <= 0)
+      throw new IllegalArgumentException("Usage: import database <name> <url>");
+
+    final String databaseName = args.substring(0, space).trim();
+    final String url = args.substring(space + 1).trim();
+
+    if (databaseName.isEmpty() || url.isEmpty())
+      throw new IllegalArgumentException("Usage: import database <name> <url>");
+
+    checkServerIsLeaderIfInHA();
+
+    final ArcadeDBServer server = httpServer.getServer();
+    Metrics.counter("http.import-database").increment();
+
+    // Create the database
+    server.createDatabase(databaseName, ComponentFile.MODE.READ_WRITE);
+    final Database database = server.getDatabase(databaseName);
+
+    if (isSSERequested(exchange)) {
+      startSSE(exchange);
+      final OutputStream out = exchange.getOutputStream();
+
+      try {
+        final Class<?> clazz = Class.forName("com.arcadedb.integration.importer.Importer");
+        final Object importer = clazz.getConstructor(Database.class, String.class).newInstance(database, url);
+
+        // Set a logger with SSE callback
+        final Class<?> loggerClass = Class.forName("com.arcadedb.integration.importer.ConsoleLogger");
+        final Class<?> listenerClass = Class.forName("com.arcadedb.integration.importer.ConsoleLogger$LogListener");
+        final Object listener = java.lang.reflect.Proxy.newProxyInstance(
+            listenerClass.getClassLoader(), new Class<?>[]{ listenerClass },
+            (proxy, method, methodArgs) -> {
+              if ("onLogLine".equals(method.getName()))
+                sendSSE(out, new JSONObject().put("status", "progress").put("message", (String) methodArgs[0]));
+              return null;
+            });
+        final Object logger = loggerClass.getConstructor(int.class, listenerClass).newInstance(2, listener);
+        clazz.getMethod("setLogger", loggerClass).invoke(importer, logger);
+
+        sendSSE(out, new JSONObject().put("status", "progress").put("message", "Importing " + databaseName + "..."));
+
+        // Start import in current thread (we're already on a worker thread)
+        // Poll ImporterContext for structured progress every second in a separate thread
+        final AtomicReference<Object> contextRef = new AtomicReference<>();
+        try { contextRef.set(clazz.getMethod("getContext").invoke(importer)); } catch (final Exception ignored) {}
+
+        final Timer progressTimer = new Timer(true);
+        if (contextRef.get() != null) {
+          progressTimer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+              try {
+                final Object ctx = contextRef.get();
+                final Class<?> ctxClass = ctx.getClass();
+                final long vertices = ((AtomicLong) ctxClass.getField("createdVertices").get(ctx)).get();
+                final long edges = ((AtomicLong) ctxClass.getField("createdEdges").get(ctx)).get();
+                final long parsed = ((AtomicLong) ctxClass.getField("parsed").get(ctx)).get();
+                if (parsed > 0)
+                  sendSSE(out, new JSONObject().put("status", "progress")
+                      .put("parsed", parsed).put("vertices", vertices).put("edges", edges));
+              } catch (final Exception ignored) {}
+            }
+          }, 1000, 1000);
+        }
+
+        try {
+          @SuppressWarnings("unchecked")
+          final Map<String, Object> result = (Map<String, Object>) clazz.getMethod("load").invoke(importer);
+          progressTimer.cancel();
+          final JSONObject done = new JSONObject().put("status", "completed")
+              .put("message", databaseName + " imported successfully");
+          if (result != null)
+            for (final Map.Entry<String, Object> e : result.entrySet())
+              done.put(e.getKey(), e.getValue());
+          sendSSE(out, done);
+        } catch (final Exception e) {
+          progressTimer.cancel();
+          final Throwable cause = e instanceof java.lang.reflect.InvocationTargetException ? e.getCause() : e;
+          sendSSE(out, new JSONObject().put("status", "error").put("message", cause.getMessage()));
+        }
+      } catch (final Exception e) {
+        final Throwable cause = e instanceof java.lang.reflect.InvocationTargetException ? e.getCause() : e;
+        sendSSE(out, new JSONObject().put("status", "error").put("message", cause.getMessage()));
+      } finally {
+        closeSSE(out);
+      }
+      return null;
+    }
+
+    // Synchronous fallback
+    database.command("sql", "import database " + url);
+    return new ExecutionResponse(200, new JSONObject().put("result", "ok").toString());
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  SSE helpers
+  // ═══════════════════════════════════════════════════════════════════
+
+  private static boolean isSSERequested(final HttpServerExchange exchange) {
+    final String accept = exchange.getRequestHeaders().getFirst("Accept");
+    return accept != null && accept.contains("text/event-stream");
+  }
+
+  private static void startSSE(final HttpServerExchange exchange) {
+    exchange.getResponseHeaders().put(new HttpString("Content-Type"), "text/event-stream");
+    exchange.getResponseHeaders().put(new HttpString("Cache-Control"), "no-cache");
+    exchange.getResponseHeaders().put(new HttpString("X-Accel-Buffering"), "no");
+    exchange.setStatusCode(200);
+    if (!exchange.isBlocking())
+      exchange.startBlocking();
+  }
+
+  private static void sendSSE(final OutputStream out, final JSONObject data) {
+    try {
+      out.write(("data: " + data + "\n\n").getBytes(StandardCharsets.UTF_8));
+      out.flush();
+    } catch (final IOException ignored) {
+      // Client disconnected
+    }
+  }
+
+  private static void closeSSE(final OutputStream out) {
+    try { out.close(); } catch (final IOException ignored) {}
   }
 
   private void dropDatabase(final String databaseName) {

@@ -26,13 +26,17 @@ import com.arcadedb.graph.NeighborView;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.schema.DocumentType;
 import com.arcadedb.schema.VertexType;
+import com.arcadedb.utility.RidHashSet;
+
+import com.arcadedb.query.QueryEngineManager;
 
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 
 /**
  * Count operator for country-partitioned triangle patterns (Q3).
@@ -78,22 +82,24 @@ public final class PartitionedTriangleOp implements CountOp {
     if (nodeCount < 1000) {
       partialCounts[0] = countRange(knowsView, nbrs, personPartition, 0, nodeCount);
     } else {
-      final Thread[] threads = new Thread[threadCount];
+      final ExecutorService executor = QueryEngineManager.getInstance().getExecutorService();
+      final Future<?>[] futures = new Future<?>[threadCount];
       final int chunkSize = (nodeCount + threadCount - 1) / threadCount;
       for (int t = 0; t < threadCount; t++) {
         final int start = t * chunkSize;
         final int end = Math.min(start + chunkSize, nodeCount);
         final int threadIdx = t;
-        threads[t] = new Thread(() ->
+        futures[t] = executor.submit(() ->
             partialCounts[threadIdx] = countRange(knowsView, nbrs, personPartition, start, end));
-        threads[t].start();
       }
-      for (final Thread thread : threads) {
+      for (final Future<?> future : futures) {
         try {
-          thread.join();
+          future.get();
         } catch (final InterruptedException e) {
           Thread.currentThread().interrupt();
           break;
+        } catch (final ExecutionException e) {
+          throw new RuntimeException("Parallel triangle counting failed", e.getCause());
         }
       }
     }
@@ -234,32 +240,57 @@ public final class PartitionedTriangleOp implements CountOp {
       }
     }
 
+    // Try GAV provider for accelerated neighbor lookups
+    final GraphTraversalProvider gavProvider = com.arcadedb.graph.GraphTraversalProviderRegistry.findProvider(db, triangleEdgeType);
+
     long total = 0;
     for (final Map.Entry<RID, RID> entry : personToPartition.entrySet()) {
-      final Vertex u = (Vertex) db.lookupByRID(entry.getKey(), true);
+      final RID uRid = entry.getKey();
       final RID uCountry = entry.getValue();
 
-      for (final Iterator<Vertex> vIt = u.getVertices(Vertex.DIRECTION.BOTH, triangleEdgeType).iterator(); vIt.hasNext(); ) {
-        final Vertex vVertex = vIt.next();
-        final RID vCountry = personToPartition.get(vVertex.getIdentity());
+      final RID[] uNeighbors = getNeighborRIDs(db, gavProvider, uRid, Vertex.DIRECTION.BOTH, triangleEdgeType);
+      for (final RID vRid : uNeighbors) {
+        final RID vCountry = personToPartition.get(vRid);
         if (vCountry == null || !vCountry.equals(uCountry))
           continue;
 
-        final Set<RID> uNeighborSet = new HashSet<>();
-        for (final Iterator<Vertex> nIt = u.getVertices(Vertex.DIRECTION.BOTH, triangleEdgeType).iterator(); nIt.hasNext(); ) {
-          final Vertex n = nIt.next();
-          final RID nCountry = personToPartition.get(n.getIdentity());
+        final RidHashSet uNeighborSet = new RidHashSet();
+        for (final RID nRid : uNeighbors) {
+          final RID nCountry = personToPartition.get(nRid);
           if (nCountry != null && nCountry.equals(uCountry))
-            uNeighborSet.add(n.getIdentity());
+            uNeighborSet.add(nRid);
         }
-        for (final Iterator<Vertex> wIt = vVertex.getVertices(Vertex.DIRECTION.BOTH, triangleEdgeType).iterator(); wIt.hasNext(); ) {
-          final Vertex w = wIt.next();
-          if (uNeighborSet.contains(w.getIdentity()))
+        final RID[] vNeighbors = getNeighborRIDs(db, gavProvider, vRid, Vertex.DIRECTION.BOTH, triangleEdgeType);
+        for (final RID wRid : vNeighbors) {
+          if (uNeighborSet.contains(wRid))
             total++;
         }
       }
     }
     return total;
+  }
+
+  /**
+   * Gets neighbor RIDs using GAV/CSR when available, falling back to OLTP.
+   */
+  private static RID[] getNeighborRIDs(final Database db, final GraphTraversalProvider provider,
+      final RID vertexRid, final Vertex.DIRECTION direction, final String edgeType) {
+    if (provider != null) {
+      final int nodeId = provider.getNodeId(vertexRid);
+      if (nodeId >= 0) {
+        final int[] neighborIds = provider.getNeighborIds(nodeId, direction, edgeType);
+        final RID[] rids = new RID[neighborIds.length];
+        for (int i = 0; i < neighborIds.length; i++)
+          rids[i] = provider.getRID(neighborIds[i]);
+        return rids;
+      }
+    }
+    // OLTP fallback
+    final Vertex v = (Vertex) db.lookupByRID(vertexRid, true);
+    final java.util.List<RID> list = new java.util.ArrayList<>();
+    for (final RID rid : v.getConnectedVertexRIDs(direction, edgeType))
+      list.add(rid);
+    return list.toArray(new RID[0]);
   }
 
   @Override

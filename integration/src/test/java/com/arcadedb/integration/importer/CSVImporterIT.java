@@ -20,12 +20,14 @@ package com.arcadedb.integration.importer;
 
 import com.arcadedb.database.Database;
 import com.arcadedb.database.DatabaseFactory;
+import com.arcadedb.database.Document;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.integration.TestHelper;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.nio.file.Files;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -342,6 +344,149 @@ class CSVImporterIT {
     } finally {
       db.drop();
     }
+    TestHelper.checkActiveDatabases();
+  }
+
+  /**
+   * Test that sparse CSV import skips null/empty values instead of storing them.
+   * With 4K columns and most being empty, records should only contain properties with actual values.
+   */
+  @Test
+  void importSparseCSVSkipsNullValues() {
+    final String databasePath = "target/databases/test-import-sparse";
+
+    final DatabaseFactory databaseFactory = new DatabaseFactory(databasePath);
+    if (databaseFactory.exists())
+      databaseFactory.open().drop();
+
+    final Database db = databaseFactory.create();
+    try {
+      db.command("sql", """
+          IMPORT DATABASE file://src/test/resources/importer-sparse.csv
+          WITH maxProperties=1000, maxPropertySize=8192
+          """);
+
+      assertThat(db.countType("Document", true)).isEqualTo(3);
+
+      // Check first row: Id=1, Name=Tesla Model 3, Engine=Electric, Seats=5, GPS=true
+      // Color, Doors, Sunroof should NOT be stored
+      db.iterateType("Document", true).forEachRemaining(record -> {
+        final Document doc = record.asDocument();
+        if ("1".equals(doc.getString("Id"))) {
+          assertThat(doc.has("Name")).isTrue();
+          assertThat(doc.has("Engine")).isTrue();
+          assertThat(doc.has("GPS")).isTrue();
+          // These should not be present - they were empty in the CSV
+          assertThat(doc.has("Color")).as("Empty Color should not be stored").isFalse();
+          assertThat(doc.has("Doors")).as("Empty Doors should not be stored").isFalse();
+          assertThat(doc.has("Sunroof")).as("Empty Sunroof should not be stored").isFalse();
+        }
+      });
+    } finally {
+      db.drop();
+    }
+    TestHelper.checkActiveDatabases();
+  }
+
+  /**
+   * Test that IMPORT DATABASE with vertexType creates vertices, not documents.
+   */
+  @Test
+  void importCSVAsVerticesViaVertexType() {
+    final String databasePath = "target/databases/test-import-vertex-type";
+
+    final DatabaseFactory databaseFactory = new DatabaseFactory(databasePath);
+    if (databaseFactory.exists())
+      databaseFactory.open().drop();
+
+    final Database db = databaseFactory.create();
+    try {
+      db.command("sql", """
+          IMPORT DATABASE file://src/test/resources/importer-sparse.csv
+          WITH vertexType=Car, maxProperties=1000, maxPropertySize=8192
+          """);
+
+      // Should create vertices, not documents
+      assertThat(db.getSchema().existsType("Car")).isTrue();
+      assertThat(db.countType("Car", true)).isEqualTo(3);
+
+      // Verify they are actual vertices
+      db.iterateType("Car", true).forEachRemaining(record -> {
+        assertThat(record.asDocument()).isInstanceOf(Vertex.class);
+      });
+
+      // Also verify sparse values are skipped
+      db.iterateType("Car", true).forEachRemaining(record -> {
+        final Vertex v = record.asVertex();
+        if ("1".equals(v.getString("Id"))) {
+          assertThat(v.has("Name")).isTrue();
+          assertThat(v.has("Color")).as("Empty Color should not be stored").isFalse();
+        }
+      });
+    } finally {
+      db.drop();
+    }
+    TestHelper.checkActiveDatabases();
+  }
+
+  /**
+   * Regression test for GitHub issue #3713: IMPORT DATABASE rejects edgeBidirectional = false
+   * When edgeBidirectional=false is specified, the edge type should be created as non-bidirectional
+   * so that unidirectional edges can be imported without error.
+   */
+  @Test
+  void regressionIssue3713EdgeBidirectionalFalse() {
+    final String databasePath = "target/databases/test-import-edge-unidirectional";
+
+    final DatabaseFactory databaseFactory = new DatabaseFactory(databasePath);
+    if (databaseFactory.exists())
+      databaseFactory.open().drop();
+
+    // Import vertices first
+    Importer importer = new Importer(new String[] {
+        "-vertices", "src/test/resources/importer-vertices.csv",
+        "-database", databasePath,
+        "-typeIdProperty", "Id",
+        "-typeIdType", "Long",
+        "-typeIdPropertyIsUnique", "true",
+        "-forceDatabaseCreate", "true"
+    });
+    importer.load();
+
+    // Import edges with edgeBidirectional=false — this was throwing IllegalArgumentException before the fix
+    importer = new Importer(new String[] {
+        "-edges", "src/test/resources/importer-edges.csv",
+        "-database", databasePath,
+        "-typeIdProperty", "Id",
+        "-typeIdType", "Long",
+        "-edgeFromField", "From",
+        "-edgeToField", "To",
+        "-edgeBidirectional", "false"
+    });
+    importer.load();
+
+    try (final Database db = databaseFactory.open()) {
+      assertThat(db.countType("Node", true)).isEqualTo(6);
+      assertThat(db.countType("Relationship", true)).as("All 3 edges should be imported").isEqualTo(3);
+
+      // Verify edge type is non-bidirectional
+      assertThat(((com.arcadedb.schema.EdgeType) db.getSchema().getType("Relationship")).isBidirectional()).isFalse();
+
+      // Verify outgoing edges exist
+      var vertex0 = db.lookupByKey("Node", "Id", 0).next().getRecord().asVertex();
+      assertThat(vertex0.countEdges(Vertex.DIRECTION.OUT, "Relationship"))
+          .as("Vertex 0 should have 2 outgoing edges").isEqualTo(2);
+
+      // For unidirectional edges, incoming edges should NOT be tracked
+      var vertex1 = db.lookupByKey("Node", "Id", 1).next().getRecord().asVertex();
+      assertThat(vertex1.countEdges(Vertex.DIRECTION.OUT, "Relationship"))
+          .as("Vertex 1 should have 1 outgoing edge (1->4)").isEqualTo(1);
+      assertThat(vertex1.countEdges(Vertex.DIRECTION.IN, "Relationship"))
+          .as("Vertex 1 should have 0 incoming edges (unidirectional)").isEqualTo(0);
+    }
+
+    databaseFactory.open().drop();
+
     TestHelper.checkActiveDatabases();
   }
 

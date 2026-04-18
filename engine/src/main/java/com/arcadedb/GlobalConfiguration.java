@@ -259,10 +259,8 @@ public enum GlobalConfiguration {
       Integer.class, 300),
 
   SQL_PARSER_IMPLEMENTATION("arcadedb.sql.parserImplementation", SCOPE.DATABASE,
-      """
-      SQL parser implementation to use. 'antlr' (default) uses the new ANTLR4-based parser with improved error messages. \
-      'javacc' uses the legacy JavaCC-based parser for backward compatibility.""",
-      String.class, "antlr", Set.of("antlr", "javacc")),
+      "Deprecated, has no effect. The ANTLR4-based SQL parser is always used.",
+      String.class, "antlr"),
 
   // OPENCYPHER
   OPENCYPHER_STATEMENT_CACHE("arcadedb.opencypher.statementCache", SCOPE.DATABASE,
@@ -373,11 +371,27 @@ public enum GlobalConfiguration {
       Recommended: 50-200 for read-heavy, 200-500 for write-heavy workloads.""",
       Integer.class, 100),
 
+  VECTOR_INDEX_INACTIVITY_REBUILD_TIMEOUT_MS("arcadedb.vectorIndex.inactivityRebuildTimeoutMs", SCOPE.DATABASE,
+      """
+      Inactivity timeout in milliseconds before flushing buffered vectors and rebuilding the HNSW graph. \
+      When mutations exist but have not reached the rebuild threshold, a timer starts after the last mutation. \
+      If no new mutations arrive within this window, the graph is rebuilt asynchronously. \
+      Set to 0 to disable (vectors are only flushed when the mutation threshold is reached). \
+      Recommended: 10000-30000 for low-volume ingestion workloads.""",
+      Integer.class, 15_000),
+
     VECTOR_INDEX_GRAPH_BUILD_DIAGNOSTICS("arcadedb.vectorIndex.graphBuildDiagnostics", SCOPE.DATABASE,
       """
       Enable diagnostic logging during vector graph build progress (heap/off-heap memory and index file sizes). \
       This provides visibility during graph construction; disable if any logging overhead is a concern.""",
         Boolean.class, true),
+
+  VECTOR_INDEX_MAX_CONCURRENT_REBUILDS("arcadedb.vectorIndex.maxConcurrentRebuilds", SCOPE.JVM,
+      """
+      Maximum number of vector index graph rebuilds that can run concurrently across all databases. \
+      Concurrent rebuilds are memory-intensive; running too many in parallel can cause OOM kills. \
+      Set to 1 to serialize all rebuilds (safest for memory). Higher values trade memory for throughput.""",
+      Integer.class, 1),
 
   // NETWORK
   NETWORK_SAME_SERVER_ERROR_RETRIES("arcadedb.network.sameServerErrorRetry", SCOPE.SERVER,
@@ -572,6 +586,10 @@ public enum GlobalConfiguration {
   BOLT_MAX_CONNECTIONS("arcadedb.bolt.maxConnections", SCOPE.SERVER,
       "Maximum number of concurrent BOLT connections. 0 means unlimited. Default is 0", Integer.class, 0),
 
+  BOLT_SSL("arcadedb.bolt.ssl", SCOPE.SERVER,
+      "TLS mode for BOLT connections: DISABLED (no TLS, default), OPTIONAL (auto-detect TLS or plaintext), REQUIRED (TLS only)",
+      String.class, "DISABLED"),
+
   // REDIS
   REDIS_PORT("arcadedb.redis.port", SCOPE.SERVER,
       "TCP/IP port number used for incoming connections for Redis plugin. Default is 6379", Integer.class, 6379),
@@ -605,7 +623,8 @@ public enum GlobalConfiguration {
   private final        SCOPE                    scope;
   private final        Callable<Object, Object> callback;
   private final        Callable<Object, Object> callbackIfNoSet;
-  private volatile     Object                   value  = nullValue;
+  private volatile     Object                   value          = nullValue;
+  private volatile     boolean                  explicitlySet  = false;
   private final        String                   description;
   private final        Boolean                  canChangeAtRuntime;
   private final        boolean                  hidden;
@@ -670,6 +689,7 @@ public enum GlobalConfiguration {
       value = callbackIfNoSet.call(null);
     else
       value = defValue;
+    explicitlySet = false;
   }
 
   public static void dumpConfiguration(final PrintStream out) {
@@ -787,7 +807,7 @@ public enum GlobalConfiguration {
    * @return {@literal true} if configuration was changed from default value and {@literal false} otherwise.
    */
   public boolean isChanged() {
-    return value != defValue;
+    return explicitlySet;
   }
 
   /**
@@ -814,6 +834,7 @@ public enum GlobalConfiguration {
 
   public void setValue(final Object iValue) {
     final Object oldValue = value;
+    explicitlySet = true;
 
     try {
       if (iValue == null)

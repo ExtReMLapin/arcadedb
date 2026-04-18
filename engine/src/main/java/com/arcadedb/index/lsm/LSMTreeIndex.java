@@ -49,6 +49,7 @@ import com.arcadedb.schema.IndexMetadata;
 import com.arcadedb.schema.LocalSchema;
 import com.arcadedb.schema.Schema;
 import com.arcadedb.schema.Type;
+import com.arcadedb.serializer.json.JSONArray;
 import com.arcadedb.serializer.BinaryComparator;
 import com.arcadedb.serializer.BinaryTypes;
 import com.arcadedb.serializer.json.JSONObject;
@@ -62,6 +63,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -93,8 +95,9 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
 
   public static class PaginatedComponentFactoryHandlerUnique implements ComponentFactory.PaginatedComponentFactoryHandler {
     @Override
-    public PaginatedComponent createOnLoad(final DatabaseInternal database, final String name, final String filePath, final int id,
-        final ComponentFile.MODE mode, final int pageSize, final int version) throws IOException {
+    public PaginatedComponent createOnLoad(final DatabaseInternal database, final String name, final String filePath,
+                                           final int id,
+                                           final ComponentFile.MODE mode, final int pageSize, final int version) throws IOException {
       if (filePath.endsWith(LSMTreeIndexCompacted.UNIQUE_INDEX_EXT))
         return new LSMTreeIndexCompacted(null, database, name, true, filePath, id, mode, pageSize, version);
 
@@ -104,8 +107,9 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
 
   public static class PaginatedComponentFactoryHandlerNotUnique implements ComponentFactory.PaginatedComponentFactoryHandler {
     @Override
-    public PaginatedComponent createOnLoad(final DatabaseInternal database, final String name, final String filePath, final int id,
-        final ComponentFile.MODE mode, final int pageSize, final int version) throws IOException {
+    public PaginatedComponent createOnLoad(final DatabaseInternal database, final String name, final String filePath,
+                                           final int id,
+                                           final ComponentFile.MODE mode, final int pageSize, final int version) throws IOException {
       if (filePath.endsWith(LSMTreeIndexCompacted.UNIQUE_INDEX_EXT))
         return new LSMTreeIndexCompacted(null, database, name, false, filePath, id, mode, pageSize, version);
 
@@ -117,12 +121,13 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
    * Called at creation time.
    */
   public LSMTreeIndex(final DatabaseInternal database, final String name, final boolean unique, final String filePath,
-      final ComponentFile.MODE mode, final Type[] keyTypes, final int pageSize,
-      final LSMTreeIndexAbstract.NULL_STRATEGY nullStrategy) {
+                      final ComponentFile.MODE mode, final Type[] keyTypes, final int pageSize,
+                      final LSMTreeIndexAbstract.NULL_STRATEGY nullStrategy) {
     try {
       this.name = name;
       this.metadata = new IndexMetadata(null, null, -1);
-      this.mutable = new LSMTreeIndexMutable(this, database, name, unique, filePath, mode, keyTypes, pageSize, nullStrategy);
+      this.mutable = new LSMTreeIndexMutable(this, database, name, unique, filePath, mode, keyTypes, pageSize,
+          nullStrategy);
     } catch (final IOException e) {
       throw new IndexException("Error on creating index '" + name + "'", e);
     }
@@ -131,8 +136,9 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
   /**
    * Called at load time (1st page only).
    */
-  public LSMTreeIndex(final DatabaseInternal database, final String name, final boolean unique, final String filePath, final int id,
-      final ComponentFile.MODE mode, final int pageSize, final int version) throws IOException {
+  public LSMTreeIndex(final DatabaseInternal database, final String name, final boolean unique, final String filePath
+      , final int id,
+                      final ComponentFile.MODE mode, final int pageSize, final int version) throws IOException {
     this.name = FileUtils.encode(name, database.getSchema().getEncoding());
     this.metadata = new IndexMetadata(null, null, -1);
     this.mutable = new LSMTreeIndexMutable(this, database, name, unique, filePath, id, mode, pageSize, version);
@@ -154,6 +160,7 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
   public void setMetadata(final IndexMetadata metadata) {
     checkIsValid();
     this.metadata = metadata;
+    updateCaseInsensitiveKeys();
   }
 
   @Override
@@ -173,6 +180,11 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
       for (int i = 0; i < jsonArray.length(); i++)
         metadata.propertyNames.add(jsonArray.getString(i));
     }
+    final JSONArray collationsJSON = indexJSON.getJSONArray("collations", null);
+    if (collationsJSON != null)
+      metadata.collations = collationsJSON.toListOfStrings();
+
+    updateCaseInsensitiveKeys();
   }
 
   @Override
@@ -295,6 +307,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
     json.put("properties", getPropertyNames());
     json.put("nullStrategy", getNullStrategy());
     json.put("unique", isUnique());
+    if (metadata.hasAnyCaseInsensitive())
+      json.put("collations", metadata.collations);
     return json;
   }
 
@@ -385,9 +399,10 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
 
   @Override
   public IndexCursor range(final boolean ascendingOrder, final Object[] beginKeys, final boolean beginKeysInclusive,
-      final Object[] endKeys, final boolean endKeysInclusive) {
+                           final Object[] endKeys, final boolean endKeysInclusive) {
     checkIsValid();
-    return lock.executeInReadLock(() -> mutable.range(ascendingOrder, beginKeys, beginKeysInclusive, endKeys, endKeysInclusive));
+    return lock.executeInReadLock(() -> mutable.range(ascendingOrder, beginKeys, beginKeysInclusive, endKeys,
+        endKeysInclusive));
   }
 
   @Override
@@ -420,7 +435,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
       Set<RID> removedRids = null;
       boolean hasRemoves = false;
 
-      final Map<TransactionIndexContext.ComparableKey, Map<TransactionIndexContext.IndexKey, TransactionIndexContext.IndexKey>> indexChanges = getDatabase().getTransaction()
+      final Map<TransactionIndexContext.ComparableKey, Map<TransactionIndexContext.IndexKey,
+          TransactionIndexContext.IndexKey>> indexChanges = getDatabase().getTransaction()
           .getIndexChanges().getIndexKeys(getName());
       if (indexChanges != null) {
         final Map<TransactionIndexContext.IndexKey, TransactionIndexContext.IndexKey> values = indexChanges.get(
@@ -516,7 +532,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
     if (getDatabase().getTransaction().getStatus() == TransactionContext.STATUS.BEGUN)
       // KEY REMOVED AT COMMIT TIME (IN A LOCK)
       getDatabase().getTransaction()
-          .addIndexOperation(this, TransactionIndexContext.IndexKey.IndexKeyOperation.REMOVE, convertedKeys, rid.getIdentity());
+          .addIndexOperation(this, TransactionIndexContext.IndexKey.IndexKeyOperation.REMOVE, convertedKeys,
+              rid.getIdentity());
     else
       lock.executeInReadLock(() -> {
         mutable.remove(convertedKeys, rid);
@@ -586,7 +603,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
 
     final int fileId = mutable.getFileId();
 
-    final LockManager.LOCK_STATUS locked = database.getTransactionManager().tryLockFile(fileId, 0, Thread.currentThread());
+    final LockManager.LOCK_STATUS locked = database.getTransactionManager().tryLockFile(fileId, 0,
+        Thread.currentThread());
     if (locked == LockManager.LOCK_STATUS.NO)
       throw new IllegalStateException("Cannot replace compacted index because cannot lock index file " + fileId);
 
@@ -603,7 +621,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
         final String newName = mutable.getName().substring(0, last_) + "_" + System.nanoTime();
 
         final LSMTreeIndexMutable newMutableIndex = new LSMTreeIndexMutable(this, database, newName, mutable.isUnique(),
-            database.getDatabasePath() + File.separator + newName, mutable.getKeyTypes(), mutable.getBinaryKeyTypes(), pageSize,
+            database.getDatabasePath() + File.separator + newName, mutable.getKeyTypes(), mutable.getBinaryKeyTypes()
+            , pageSize,
             LSMTreeIndexMutable.CURRENT_VERSION, compactedIndex);
         database.getSchema().getEmbedded().registerFile(newMutableIndex);
 
@@ -658,7 +677,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
         try {
           prevMutable.drop();
         } catch (final IOException e) {
-          LogManager.instance().log(this, Level.WARNING, "Error on deleting old copy of mutable index file %s", e, prevMutable);
+          LogManager.instance().log(this, Level.WARNING, "Error on deleting old copy of mutable index file %s", e,
+              prevMutable);
         }
 
       return result;
@@ -685,7 +705,8 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
 
     if (status.compareAndSet(INDEX_STATUS.AVAILABLE, INDEX_STATUS.UNAVAILABLE)) {
 
-      LogManager.instance().log(this, Level.INFO, "Building index '%s' on %d properties...", name, metadata.propertyNames.size());
+      LogManager.instance().log(this, Level.INFO, "Building index '%s' on %s...", name,
+          getTypeName() + metadata.propertyNames);
 
       final long startTime = System.currentTimeMillis();
 
@@ -733,15 +754,33 @@ public class LSMTreeIndex implements RangeIndex, IndexInternal {
   private Object[] convertKeys(final Object[] keys) {
     if (keys != null) {
       final byte[] keyTypes = mutable.binaryKeyTypes;
+      final boolean[] ciKeys = mutable.caseInsensitiveKeys;
       final Object[] convertedKeys = new Object[keys.length];
       for (int i = 0; i < keys.length; ++i) {
         if (keys[i] == null)
           continue;
         convertedKeys[i] = Type.convert(getDatabase(), keys[i], BinaryTypes.getClassFromType(keyTypes[i]));
+        // Apply case-insensitive collation
+        if (convertedKeys[i] instanceof String s && ciKeys != null && i < ciKeys.length && ciKeys[i])
+          convertedKeys[i] = s.toLowerCase(Locale.ROOT);
       }
       return convertedKeys;
     }
     return null;
+  }
+
+  /**
+   * Propagates CI collation flags from metadata to the mutable (and compacted) index's boolean array.
+   */
+  private void updateCaseInsensitiveKeys() {
+    if (metadata != null && metadata.hasAnyCaseInsensitive()) {
+      final boolean[] flags = new boolean[metadata.propertyNames.size()];
+      for (int i = 0; i < flags.length; i++)
+        flags[i] = metadata.isCaseInsensitive(i);
+      mutable.caseInsensitiveKeys = flags;
+      if (mutable.getSubIndex() != null)
+        mutable.getSubIndex().caseInsensitiveKeys = flags;
+    }
   }
 
   private void checkIsValid() {

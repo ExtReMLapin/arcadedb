@@ -101,11 +101,11 @@
       function processNotificationQueue() {
         while (notificationQueue.length > 0 && isToastReady) {
           var n = notificationQueue.shift();
-          showNotification(n.title, n.message, n.type);
+          showNotification(n.title, n.message, n.type, n.delay);
         }
       }
 
-      function showNotification(title, message, type) {
+      function showNotification(title, message, type, delay) {
         var container = document.getElementById('toastContainer');
         if (!container) return;
 
@@ -125,17 +125,17 @@
           '<div class="toast-body">' + (message || '') + '</div>';
 
         container.appendChild(toastEl);
-        var toast = new bootstrap.Toast(toastEl, { delay: 3500 });
+        var toast = new bootstrap.Toast(toastEl, { delay: delay || 3500 });
         toast.show();
         toastEl.addEventListener('hidden.bs.toast', function() { toastEl.remove(); });
       }
 
-      function globalNotify(title, message, type) {
+      function globalNotify(title, message, type, delay) {
         if (!isToastReady) {
-          notificationQueue.push({ title: title, message: message, type: type });
+          notificationQueue.push({ title: title, message: message, type: type, delay: delay });
           return;
         }
-        showNotification(title, message, type);
+        showNotification(title, message, type, delay);
       }
     </script>
 
@@ -272,7 +272,22 @@
           </div>
 
           <div class="col-11">
-            <div class="tab-content">
+            <div id="quickStartPanel" style="display:none; height: 100%; overflow-y: auto; position: relative;">
+              <div style="max-width: 880px; margin: 0 auto; padding: 48px 24px;">
+                <div style="text-align: center; margin-bottom: 36px;">
+                  <i class="fa fa-rocket" style="font-size: 2.5rem; color: #00aeee; margin-bottom: 12px; display: block;"></i>
+                  <h3 style="font-weight: 600; margin-bottom: 8px;">Get Started with ArcadeDB</h3>
+                  <p style="color: var(--text-secondary, #888); margin-bottom: 20px;">No databases found. Create an empty one or import a sample dataset with one click.</p>
+                  <button class="btn db-action-btn" onclick="createDatabase()" style="padding: 8px 24px; font-size: 0.95rem;">
+                    <i class="fa fa-plus"></i> Create Empty Database
+                  </button>
+                </div>
+                <div class="quick-start-divider"><span>or import a sample dataset</span></div>
+                <div id="quickStartDatasets" class="row g-3"></div>
+              </div>
+              <div id="quickStartOverlay"></div>
+            </div>
+            <div class="tab-content" id="mainTabContent">
               ${include:query.html} ${include:database.html} ${include:timeseries.html} ${include:server.html} ${include:profiler.html} ${include:security.html} ${include:cluster.html} ${include:ai.html} ${include:api.html} ${include:resources.html} ${include:settings.html}
             </div>
           </div>
@@ -306,6 +321,23 @@
       </div>
     </div>
 
+    <!-- Import Dataset modal -->
+    <div class="modal fade" id="importDatasetModal" tabindex="-1" style="z-index: 10100">
+      <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title"><i class="fa fa-download" style="color: #00aeee;"></i> Import Sample Dataset</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+          </div>
+          <div class="modal-body">
+            <p class="text-muted" style="font-size: 0.9rem;">Select a dataset to create a new database and import it.</p>
+            <div id="importDatasetCards" class="row g-3"></div>
+            <div id="importDatasetOverlay" style="display:none; position: absolute; inset: 0; background: rgba(255,255,255,0.92); z-index: 10; align-items: center; justify-content: center; flex-direction: column; border-radius: 8px;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Toast container -->
     <div id="toastContainer" class="toast-container position-fixed top-0 end-0 p-3" style="z-index: 10500;"></div>
 
@@ -323,6 +355,22 @@
 
         $('a[data-bs-toggle="tab"]').on("shown.bs.tab", function (e) {
           var activeTab = this.id;
+
+          // Tabs that don't require a database - always show main content
+          var noDatabaseTabs = ["tab-server-sel", "tab-profiler-sel", "tab-security-sel",
+            "tab-cluster-sel", "tab-api-sel", "tab-resources-sel", "tab-ai-sel", "tab-settings-sel"];
+          if (noDatabaseTabs.indexOf(activeTab) >= 0) {
+            $("#quickStartPanel").hide();
+            $("#mainTabContent").show();
+          }
+
+          // Tabs that require a database - show quick start if none exists
+          var databaseTabs = ["tab-query-sel", "tab-database-sel", "tab-timeseries-sel"];
+          if (databaseTabs.indexOf(activeTab) >= 0 && !getCurrentDatabase()) {
+            $("#mainTabContent").hide();
+            showQuickStart();
+          }
+
           if (activeTab == "tab-query-sel") {
             studioCurrentTab = "query";
             editorFocus();

@@ -59,7 +59,8 @@ public class CSRBuilder {
   static final int DEFAULT_PROPERTY_SAMPLE_SIZE = 100;
 
   private final Database database;
-  private final Set<String> propertyFilterSet; // null = all properties, empty = no properties
+  private final Set<String> propertyIncludeSet;  // non-null = include only these properties
+  private final Set<String> propertyExcludeSet;  // non-null = include all EXCEPT these properties
   private final Set<String> edgePropertyFilterSet; // null = no edge properties (default)
   private final int propertySampleSize;
 
@@ -78,10 +79,44 @@ public class CSRBuilder {
   public CSRBuilder(final Database database, final String[] propertyFilter, final String[] edgePropertyFilter,
       final int propertySampleSize) {
     this.database = database;
-    this.propertyFilterSet = propertyFilter != null ? new HashSet<>(Arrays.asList(propertyFilter)) : null;
     this.edgePropertyFilterSet = edgePropertyFilter != null && edgePropertyFilter.length > 0
         ? new HashSet<>(Arrays.asList(edgePropertyFilter)) : null;
     this.propertySampleSize = propertySampleSize;
+
+    // Parse property filter: entries starting with '!' are exclusions, others are inclusions.
+    // All entries must be the same mode (all include or all exclude).
+    if (propertyFilter != null) {
+      final Set<String> includes = new HashSet<>();
+      final Set<String> excludes = new HashSet<>();
+      for (final String p : propertyFilter) {
+        if (p.startsWith("!"))
+          excludes.add(p.substring(1));
+        else
+          includes.add(p);
+      }
+      if (!excludes.isEmpty()) {
+        propertyExcludeSet = excludes;
+        propertyIncludeSet = null;
+      } else {
+        propertyIncludeSet = includes;
+        propertyExcludeSet = null;
+      }
+    } else {
+      propertyIncludeSet = null;
+      propertyExcludeSet = null;
+    }
+  }
+
+  /**
+   * Checks whether a property name passes the filter.
+   * Returns true if the property should be included in the columnar store.
+   */
+  private boolean isPropertyIncluded(final String propName) {
+    if (propertyExcludeSet != null)
+      return !propertyExcludeSet.contains(propName);
+    if (propertyIncludeSet != null)
+      return propertyIncludeSet.contains(propName);
+    return true; // null filter = include all
   }
 
   /**
@@ -97,8 +132,12 @@ public class CSRBuilder {
   }
 
   private CSRResult buildClean(final String[] vertexTypes, final String[] edgeTypes, final long startTime) {
+    LogManager.instance().log(this, Level.INFO, "CSR build started for vertex types %s, edge types %s...",
+        vertexTypes != null ? Arrays.toString(vertexTypes) : "[all]",
+        edgeTypes != null ? Arrays.toString(edgeTypes) : "[all]");
+
     final Map<Integer, String> bucketToEdgeType = buildBucketToEdgeTypeMap(edgeTypes);
-    final boolean extractProps = propertyFilterSet == null || !propertyFilterSet.isEmpty();
+    final boolean extractProps = propertyIncludeSet == null || !propertyIncludeSet.isEmpty() || propertyExcludeSet != null;
 
     // --- Phase A: Collect RID positions for node ID mapping ---
     final NodeIdMapping mapping = new NodeIdMapping(16);
@@ -164,7 +203,7 @@ public class CSRBuilder {
         for (final String propName : vertex.getPropertyNames()) {
           if (detectedTypes.containsKey(propName))
             continue;
-          if (propertyFilterSet != null && !propertyFilterSet.contains(propName))
+          if (!isPropertyIncluded(propName))
             continue;
           final Object value = vertex.get(propName);
           if (value == null)
@@ -522,7 +561,7 @@ public class CSRBuilder {
 
   private void collectSchemaProperties(final DocumentType type, final Map<String, Column.Type> result) {
     for (final Property prop : type.getProperties()) {
-      if (propertyFilterSet != null && !propertyFilterSet.contains(prop.getName()))
+      if (!isPropertyIncluded(prop.getName()))
         continue;
       final Column.Type colType = schemaTypeToColumnType(prop.getType());
       if (colType == null)
@@ -753,70 +792,168 @@ public class CSRBuilder {
   }
 
   /**
-   * Computes a BFS-order vertex renumbering from the highest-degree node.
-   * After renumbering, graph-nearby nodes have nearby dense IDs,
-   * dramatically improving cache locality for all graph algorithms.
+   * Computes a Reverse Cuthill-McKee (RCM) vertex renumbering for optimal cache locality.
+   * <p>
+   * RCM minimizes the <b>bandwidth</b> of the adjacency matrix (the maximum distance between
+   * any node and its neighbors in the ID space). This is superior to plain BFS ordering because:
+   * <ul>
+   *   <li>Root selection: starts from a <b>peripheral node</b> (pseudo-diameter endpoint)
+   *       rather than the highest-degree hub, which spreads IDs more evenly</li>
+   *   <li>Visit order: within each BFS level, neighbors are visited in <b>ascending degree</b>
+   *       order, pushing high-degree hubs toward the middle of the ID space</li>
+   *   <li>Reversal: the BFS order is <b>reversed</b>, which provably reduces bandwidth
+   *       (Cuthill-McKee theorem)</li>
+   * </ul>
    *
    * @return oldToNew mapping: oldToNew[oldId] = newId
    */
   static int[] computeBfsOrdering(final int nodeCount, final Map<String, CSRAdjacencyIndex> csrPerType) {
-    final int[] oldToNew = new int[nodeCount];
-    Arrays.fill(oldToNew, -1);
+    if (nodeCount == 0)
+      return new int[0];
 
-    // Build combined degree for all edge types to find the best root
-    int root = 0;
-    int maxDeg = 0;
+    // Pre-compute combined degree for all edge types (used for root selection + degree-sorted BFS)
+    final int[] degree = new int[nodeCount];
     for (final CSRAdjacencyIndex csr : csrPerType.values()) {
       final int[] fwdOffsets = csr.getForwardOffsets();
       final int[] bwdOffsets = csr.getBackwardOffsets();
-      for (int u = 0; u < nodeCount; u++) {
-        final int deg = (fwdOffsets[u + 1] - fwdOffsets[u]) + (bwdOffsets[u + 1] - bwdOffsets[u]);
-        if (deg > maxDeg) {
-          maxDeg = deg;
-          root = u;
-        }
-      }
+      for (int u = 0; u < nodeCount; u++)
+        degree[u] += (fwdOffsets[u + 1] - fwdOffsets[u]) + (bwdOffsets[u + 1] - bwdOffsets[u]);
     }
 
-    // BFS renumbering from highest-degree root
-    int nextId = 0;
+    // --- Step 1: Find a peripheral node (pseudo-diameter endpoint) ---
+    // Start from the lowest-degree non-isolated node, BFS to find the farthest node,
+    // then BFS again from that node. The endpoint of the second BFS is a good peripheral root.
+    int start = 0;
+    int minDeg = Integer.MAX_VALUE;
+    for (int u = 0; u < nodeCount; u++) {
+      if (degree[u] > 0 && degree[u] < minDeg) {
+        minDeg = degree[u];
+        start = u;
+      }
+    }
+    // Two BFS passes to find pseudo-peripheral node
+    for (int pass = 0; pass < 2; pass++)
+      start = bfsFarthest(start, nodeCount, degree, csrPerType);
+
+    // --- Step 2: BFS from peripheral root with degree-sorted neighbor visitation ---
+    final int[] bfsOrder = new int[nodeCount];
+    final boolean[] visited = new boolean[nodeCount];
+    int orderSize = 0;
+
     final int[] queue = new int[nodeCount];
     int head = 0, tail = 0;
-    oldToNew[root] = nextId++;
-    queue[tail++] = root;
+    visited[start] = true;
+    queue[tail++] = start;
+    bfsOrder[orderSize++] = start;
+
+    // Temp buffer for collecting unvisited neighbors before sorting by degree
+    int[] neighborBuf = new int[1024];
 
     while (head < tail) {
       final int u = queue[head++];
+
+      // Collect all unvisited neighbors across all edge types
+      int nbCount = 0;
       for (final CSRAdjacencyIndex csr : csrPerType.values()) {
-        // Traverse forward neighbors
         final int[] fwdOffsets = csr.getForwardOffsets();
         final int[] fwdNeighbors = csr.getForwardNeighbors();
         for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++) {
           final int v = fwdNeighbors[j];
-          if (oldToNew[v] < 0) {
-            oldToNew[v] = nextId++;
-            queue[tail++] = v;
+          if (!visited[v]) {
+            visited[v] = true;
+            if (nbCount >= neighborBuf.length)
+              neighborBuf = Arrays.copyOf(neighborBuf, neighborBuf.length * 2);
+            neighborBuf[nbCount++] = v;
           }
         }
-        // Traverse backward neighbors (for directed graphs, reach "parent" nodes too)
         final int[] bwdOffsets = csr.getBackwardOffsets();
         final int[] bwdNeighbors = csr.getBackwardNeighbors();
         for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++) {
           final int v = bwdNeighbors[j];
-          if (oldToNew[v] < 0) {
-            oldToNew[v] = nextId++;
-            queue[tail++] = v;
+          if (!visited[v]) {
+            visited[v] = true;
+            if (nbCount >= neighborBuf.length)
+              neighborBuf = Arrays.copyOf(neighborBuf, neighborBuf.length * 2);
+            neighborBuf[nbCount++] = v;
           }
         }
       }
+
+      // Sort neighbors by ascending degree (key RCM optimization: low-degree nodes first)
+      if (nbCount > 1)
+        sortByDegree(neighborBuf, nbCount, degree);
+
+      // Enqueue sorted neighbors
+      for (int i = 0; i < nbCount; i++) {
+        final int v = neighborBuf[i];
+        queue[tail++] = v;
+        bfsOrder[orderSize++] = v;
+      }
     }
 
-    // Assign remaining disconnected nodes
+    // Handle disconnected nodes (not reached by BFS)
     for (int u = 0; u < nodeCount; u++)
-      if (oldToNew[u] < 0)
-        oldToNew[u] = nextId++;
+      if (!visited[u])
+        bfsOrder[orderSize++] = u;
+
+    // --- Step 3: Reverse the BFS order (the "R" in RCM) ---
+    // Reversal provably reduces bandwidth (Cuthill-McKee theorem)
+    final int[] oldToNew = new int[nodeCount];
+    for (int i = 0; i < nodeCount; i++)
+      oldToNew[bfsOrder[i]] = nodeCount - 1 - i;
 
     return oldToNew;
+  }
+
+  /**
+   * BFS from {@code start}, returns the farthest node reached (last node in last BFS level).
+   * Used to find pseudo-peripheral nodes for RCM root selection.
+   */
+  private static int bfsFarthest(final int start, final int nodeCount, final int[] degree,
+      final Map<String, CSRAdjacencyIndex> csrPerType) {
+    final boolean[] visited = new boolean[nodeCount];
+    final int[] queue = new int[nodeCount];
+    int head = 0, tail = 0;
+    visited[start] = true;
+    queue[tail++] = start;
+    int farthest = start;
+    while (head < tail) {
+      farthest = queue[head];
+      final int u = queue[head++];
+      for (final CSRAdjacencyIndex csr : csrPerType.values()) {
+        final int[] fwdOffsets = csr.getForwardOffsets();
+        final int[] fwdNeighbors = csr.getForwardNeighbors();
+        for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++) {
+          final int v = fwdNeighbors[j];
+          if (!visited[v]) { visited[v] = true; queue[tail++] = v; }
+        }
+        final int[] bwdOffsets = csr.getBackwardOffsets();
+        final int[] bwdNeighbors = csr.getBackwardNeighbors();
+        for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++) {
+          final int v = bwdNeighbors[j];
+          if (!visited[v]) { visited[v] = true; queue[tail++] = v; }
+        }
+      }
+    }
+    return farthest;
+  }
+
+  /**
+   * Insertion-sorts {@code buf[0..count)} by ascending {@code degree[buf[i]]}.
+   * Insertion sort is optimal here because neighbor lists are typically small (avg ~50-100)
+   * and already partially ordered by CSR adjacency.
+   */
+  private static void sortByDegree(final int[] buf, final int count, final int[] degree) {
+    for (int i = 1; i < count; i++) {
+      final int key = buf[i];
+      final int keyDeg = degree[key];
+      int j = i - 1;
+      while (j >= 0 && degree[buf[j]] > keyDeg) {
+        buf[j + 1] = buf[j];
+        j--;
+      }
+      buf[j + 1] = key;
+    }
   }
 
   /**

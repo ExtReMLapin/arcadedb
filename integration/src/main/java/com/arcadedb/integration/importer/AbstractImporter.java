@@ -62,6 +62,14 @@ public abstract class AbstractImporter {
         settings.parseParameter(entry.getKey(), entry.getValue());
   }
 
+  public ImporterContext getContext() {
+    return context;
+  }
+
+  public void setLogger(final ConsoleLogger logger) {
+    this.logger = logger;
+  }
+
   protected void printProgress() {
     if (format != null)
       format.printProgress(settings, context, source, parser, logger);
@@ -183,10 +191,11 @@ public abstract class AbstractImporter {
 
   protected EdgeType getOrCreateEdgeType(final String name) {
     if (!database.getSchema().existsType(name)) {
-      LogManager.instance().log(this, Level.INFO, "Creating type '%s' of type EDGE", name);
+      LogManager.instance().log(this, Level.INFO, "Creating type '%s' of type EDGE (bidirectional=%s)", name, settings.edgeBidirectional);
 
       beginTxIfNeeded();
-      return database.getSchema().buildEdgeType().withName(name).withTotalBuckets(settings.parallel).create();
+      return database.getSchema().buildEdgeType().withName(name).withTotalBuckets(settings.parallel)
+          .withBidirectional(settings.edgeBidirectional).create();
     }
 
     return (EdgeType) database.getSchema().getType(name);

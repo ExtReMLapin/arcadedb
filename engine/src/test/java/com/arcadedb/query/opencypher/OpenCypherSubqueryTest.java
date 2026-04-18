@@ -168,6 +168,71 @@ class OpenCypherSubqueryTest {
   }
 
   /**
+   * Issue #3769: WHERE clause inside a CALL subquery always returns false.
+   * MERGE creates a node, coalesce produces an empty list, and the WHERE inside
+   * the CALL subquery should let the row pass through because any() on an empty
+   * list returns false, so NOT false = true.
+   */
+  @Test
+  void callSubqueryWhereClauseNotAlwaysFalse() {
+    database.getSchema().createVertexType("Thing1");
+
+    database.transaction(() -> {
+      final ResultSet result = database.command("opencypher",
+          "MERGE (t1:Thing1 {username: \"bob\"}) WITH coalesce(t1.aList, []) AS aList " +
+              "CALL { WITH aList WITH aList " +
+              "WHERE NOT any(element IN aList WHERE element = \"92dc13ff-50d1-4879-b2fd-b0dedf7ec019\") " +
+              "RETURN true AS success1 } RETURN success1");
+
+      final List<Result> rows = new ArrayList<>();
+      while (result.hasNext())
+        rows.add(result.next());
+
+      assertThat(rows).as("Expected one row with success1=true, got empty result set").hasSize(1);
+      assertThat((Boolean) rows.get(0).getProperty("success1")).isTrue();
+    });
+  }
+
+  /**
+   * Simpler test for WHERE inside CALL subquery with an empty list.
+   * Tests that the WHERE clause correctly evaluates to true for an empty list.
+   */
+  @Test
+  void callSubqueryWhereWithEmptyList() {
+    final ResultSet result = database.query("opencypher",
+        "WITH [] AS aList " +
+            "CALL { WITH aList WITH aList " +
+            "WHERE NOT any(element IN aList WHERE element = \"x\") " +
+            "RETURN true AS success1 } RETURN success1");
+
+    final List<Result> rows = new ArrayList<>();
+    while (result.hasNext())
+      rows.add(result.next());
+
+    assertThat(rows).as("WHERE on empty list should pass through").hasSize(1);
+    assertThat((Boolean) rows.get(0).getProperty("success1")).isTrue();
+  }
+
+  /**
+   * Test that WHERE inside CALL subquery correctly filters when condition is false.
+   */
+  @Test
+  void callSubqueryWhereFiltersTrueCondition() {
+    final ResultSet result = database.query("opencypher",
+        "WITH [\"x\"] AS aList " +
+            "CALL { WITH aList WITH aList " +
+            "WHERE NOT any(element IN aList WHERE element = \"x\") " +
+            "RETURN true AS success1 } RETURN success1");
+
+    final List<Result> rows = new ArrayList<>();
+    while (result.hasNext())
+      rows.add(result.next());
+
+    // any(element IN ["x"] WHERE element = "x") = true, NOT true = false, so no rows
+    assertThat(rows).as("WHERE should filter out the row").hasSize(0);
+  }
+
+  /**
    * CALL subquery with multiple imported variables.
    */
   @Test
@@ -190,5 +255,50 @@ class OpenCypherSubqueryTest {
       assertThat(sum).isNotNull();
       assertThat(sum.longValue()).isEqualTo(a.longValue() + b.longValue());
     }
+  }
+
+  /**
+   * Issue #3772: UNION inside CALL subquery should evaluate all branches.
+   * When the first branch's WHERE filters out all rows, the second branch should still produce results.
+   */
+  @Test
+  void callSubqueryWithUnionFallsThrough() {
+    // First query: empty list, so SIZE > 0 is false, but SIZE = 0 is true -> should return success2 = 1
+    final ResultSet result1 = database.query("opencypher",
+        "WITH [] as toRemove " +
+        "CALL { " +
+        "  WITH toRemove WITH toRemove " +
+        "  WHERE SIZE(toRemove) > 0 " +
+        "  RETURN 2 AS success2 " +
+        "  UNION " +
+        "  WITH toRemove WITH toRemove " +
+        "  WHERE SIZE(toRemove) = 0 " +
+        "  RETURN 1 AS success2 " +
+        "} " +
+        "RETURN success2");
+
+    assertThat(result1.hasNext()).isTrue();
+    final Result row1 = result1.next();
+    assertThat(((Number) row1.getProperty("success2")).intValue()).isEqualTo(1);
+    assertThat(result1.hasNext()).isFalse();
+
+    // Second query: non-empty list, so SIZE > 0 is true -> should return success2 = 2
+    final ResultSet result2 = database.query("opencypher",
+        "WITH ['a'] as toRemove " +
+        "CALL { " +
+        "  WITH toRemove WITH toRemove " +
+        "  WHERE SIZE(toRemove) > 0 " +
+        "  RETURN 2 AS success2 " +
+        "  UNION " +
+        "  WITH toRemove WITH toRemove " +
+        "  WHERE SIZE(toRemove) = 0 " +
+        "  RETURN 1 AS success2 " +
+        "} " +
+        "RETURN success2");
+
+    assertThat(result2.hasNext()).isTrue();
+    final Result row2 = result2.next();
+    assertThat(((Number) row2.getProperty("success2")).intValue()).isEqualTo(2);
+    assertThat(result2.hasNext()).isFalse();
   }
 }

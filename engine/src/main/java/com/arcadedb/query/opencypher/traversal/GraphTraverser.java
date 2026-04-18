@@ -18,16 +18,15 @@
  */
 package com.arcadedb.query.opencypher.traversal;
 
-import com.arcadedb.database.RID;
 import com.arcadedb.graph.Edge;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.opencypher.ast.Direction;
+import com.arcadedb.query.opencypher.ast.PathMode;
+import com.arcadedb.utility.RidHashSet;
 
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Base class for graph traversal implementations.
@@ -41,6 +40,7 @@ public abstract class GraphTraverser {
   protected final int maxHops;
   protected final boolean trackPaths;
   protected final boolean detectCycles;
+  protected final PathMode pathMode;
 
   /**
    * Creates a graph traverser with specified parameters.
@@ -60,16 +60,21 @@ public abstract class GraphTraverser {
   protected GraphTraverser(final Direction direction, final String[] relationshipTypes,
       final Map<String, Object> edgePropertyFilters, final int minHops, final int maxHops,
       final boolean trackPaths, final boolean detectCycles) {
+    this(direction, relationshipTypes, edgePropertyFilters, minHops, maxHops, trackPaths,
+        detectCycles ? PathMode.ACYCLIC : PathMode.WALK);
+  }
+
+  protected GraphTraverser(final Direction direction, final String[] relationshipTypes,
+      final Map<String, Object> edgePropertyFilters, final int minHops, final int maxHops,
+      final boolean trackPaths, final PathMode pathMode) {
     this.direction = direction != null ? direction : Direction.BOTH;
     this.relationshipTypes = relationshipTypes;
     this.edgePropertyFilters = edgePropertyFilters != null ? edgePropertyFilters : Collections.emptyMap();
     this.minHops = Math.max(0, minHops);
     this.maxHops = maxHops >= 0 ? maxHops : Integer.MAX_VALUE;
     this.trackPaths = trackPaths;
-    this.detectCycles = detectCycles;
-
-    // When minHops > maxHops, traversal naturally returns empty results
-    // (no path can satisfy depth >= minHops AND depth <= maxHops)
+    this.pathMode = pathMode != null ? pathMode : PathMode.TRAIL;
+    this.detectCycles = this.pathMode != PathMode.WALK;
   }
 
   /**
@@ -186,40 +191,34 @@ public abstract class GraphTraverser {
 
   /**
    * Creates a visited set for cycle detection.
-   * Uses RIDs instead of Vertex objects for efficient O(1) hash lookups.
+   * Uses RidHashSet for zero-boxing O(1) lookups with ~8.7x memory savings over HashSet&lt;RID&gt;.
    *
-   * @return new hash set for tracking visited vertex RIDs
+   * @return new RidHashSet for tracking visited vertex RIDs
    */
-  protected Set<RID> createVisitedSet() {
-    return new HashSet<>();
+  protected RidHashSet createVisitedSet() {
+    return new RidHashSet();
   }
 
   /**
    * Checks if a vertex has been visited.
-   * O(1) hash lookup using RID.
-   * Creates a database-independent RID to ensure proper equality/hashCode.
+   * O(1) hash lookup using primitive bucketId + offset — no temporary RID allocation.
    *
    * @param vertex  vertex to check
    * @param visited set of visited vertex RIDs
    * @return true if visited
    */
-  protected boolean isVisited(final Vertex vertex, final Set<RID> visited) {
-    final RID rid = vertex.getIdentity();
-    // Create database-independent RID for consistent equals/hashCode
-    return visited.contains(new RID(rid.getBucketId(), rid.getPosition()));
+  protected boolean isVisited(final Vertex vertex, final RidHashSet visited) {
+    return visited.contains(vertex.getIdentity());
   }
 
   /**
    * Marks a vertex as visited.
-   * Stores only the RID for memory efficiency and O(1) lookups.
-   * Creates a database-independent RID to ensure proper equality/hashCode.
+   * Stores only primitive bucketId + offset for memory efficiency and O(1) lookups.
    *
    * @param vertex  vertex to mark
    * @param visited set of visited vertex RIDs
    */
-  protected void markVisited(final Vertex vertex, final Set<RID> visited) {
-    final RID rid = vertex.getIdentity();
-    // Create database-independent RID for consistent equals/hashCode
-    visited.add(new RID(rid.getBucketId(), rid.getPosition()));
+  protected void markVisited(final Vertex vertex, final RidHashSet visited) {
+    visited.add(vertex.getIdentity());
   }
 }

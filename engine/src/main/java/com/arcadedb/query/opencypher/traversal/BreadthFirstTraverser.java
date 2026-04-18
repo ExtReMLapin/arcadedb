@@ -22,16 +22,16 @@ import com.arcadedb.database.RID;
 import com.arcadedb.graph.Edge;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.opencypher.ast.Direction;
+import com.arcadedb.query.opencypher.ast.PathMode;
+import com.arcadedb.utility.RidHashSet;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Queue;
-import java.util.Set;
 
 /**
  * Breadth-first graph traverser.
@@ -51,6 +51,12 @@ public class BreadthFirstTraverser extends GraphTraverser {
     super(direction, relationshipTypes, edgePropertyFilters, minHops, maxHops, trackPaths, detectCycles);
   }
 
+  public BreadthFirstTraverser(final Direction direction, final String[] relationshipTypes,
+      final Map<String, Object> edgePropertyFilters, final int minHops,
+      final int maxHops, final boolean trackPaths, final PathMode pathMode) {
+    super(direction, relationshipTypes, edgePropertyFilters, minHops, maxHops, trackPaths, pathMode);
+  }
+
   @Override
   public Iterator<Vertex> traverse(final Vertex startVertex) {
     return new BFSVertexIterator(startVertex);
@@ -66,12 +72,12 @@ public class BreadthFirstTraverser extends GraphTraverser {
    */
   private class BFSVertexIterator implements Iterator<Vertex> {
     private final Queue<VertexWithDepth> queue = new LinkedList<>();
-    private final Set<RID> visited;
+    private final RidHashSet visited;
     private final List<Vertex> results = new ArrayList<>();
     private int currentIndex = 0;
 
     BFSVertexIterator(final Vertex startVertex) {
-      this.visited = detectCycles ? createVisitedSet() : new HashSet<>();
+      this.visited = createVisitedSet();
       queue.add(new VertexWithDepth(startVertex, 0));
 
       // Perform full BFS traversal
@@ -170,11 +176,16 @@ public class BreadthFirstTraverser extends GraphTraverser {
           if (!matchesPropertyFilter(edge))
             continue;
 
-          // Cypher relationship uniqueness: skip edges already used in this path
-          if (detectCycles && pathContainsEdge(path, edge))
+          // Path mode: TRAIL/ACYCLIC = edge uniqueness, WALK = no restriction
+          if (pathMode != PathMode.WALK && pathContainsEdge(path, edge))
             continue;
 
           final Vertex nextVertex = getOtherVertex(edge, vertex);
+
+          // ACYCLIC: also enforce vertex uniqueness
+          if (pathMode == PathMode.ACYCLIC && path.containsVertex(nextVertex))
+            continue;
+
           final TraversalPath newPath = new TraversalPath(path, edge, nextVertex);
           queue.add(new PathWithDepth(newPath, depth + 1));
         }

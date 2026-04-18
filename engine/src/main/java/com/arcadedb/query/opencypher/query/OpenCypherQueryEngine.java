@@ -265,6 +265,12 @@ public class OpenCypherQueryEngine implements QueryEngine {
     case DROP_CONSTRAINT:
       executeDropConstraint(ddl, schema);
       break;
+    case CREATE_INDEX:
+      executeCreateIndex(ddl, schema);
+      break;
+    case DROP_INDEX:
+      executeDropIndex(ddl, schema);
+      break;
     }
 
     return new InternalResultSet();
@@ -274,10 +280,27 @@ public class OpenCypherQueryEngine implements QueryEngine {
     final String typeName = ddl.getLabelName();
     final String[] propertyNames = ddl.getPropertyNames().toArray(new String[0]);
 
+    // Auto-create the type if it doesn't exist (Cypher does not require types to be pre-declared)
+    if (!schema.existsType(typeName)) {
+      if (ddl.isForRelationship())
+        schema.getOrCreateEdgeType(typeName);
+      else
+        schema.getOrCreateVertexType(typeName);
+    }
+
+    // For TYPED constraints, resolve the target type first so properties are created with the correct type
+    final Type propertyType = ddl.getConstraintKind() == CypherDDLStatement.ConstraintKind.TYPED
+        ? mapCypherType(ddl.getTypedName()) : Type.STRING;
+
     // Ensure all properties exist before creating indexes (ArcadeDB requires this)
     for (final String propName : propertyNames) {
-      if (schema.getType(typeName).getPropertyIfExists(propName) == null)
-        schema.getType(typeName).createProperty(propName, Type.STRING);
+      final Property existing = schema.getType(typeName).getPropertyIfExists(propName);
+      if (existing == null)
+        schema.getType(typeName).createProperty(propName, propertyType);
+      else if (ddl.getConstraintKind() == CypherDDLStatement.ConstraintKind.TYPED && existing.getType() != propertyType) {
+        schema.getType(typeName).dropProperty(propName);
+        schema.getType(typeName).createProperty(propName, propertyType);
+      }
     }
 
     switch (ddl.getConstraintKind()) {
@@ -304,6 +327,61 @@ public class OpenCypherQueryEngine implements QueryEngine {
       for (final String propName : propertyNames)
         schema.getType(typeName).getPropertyIfExists(propName).setMandatory(true);
       break;
+
+    case TYPED:
+      // Property type already set above; for IF NOT EXISTS, silently succeed if property already has the correct type
+      break;
+    }
+  }
+
+  /**
+   * Maps a Cypher type name (from IS TYPED constraints) to an ArcadeDB Type.
+   */
+  private static Type mapCypherType(final String cypherType) {
+    switch (cypherType) {
+    case "BOOLEAN":
+    case "BOOL":
+      return Type.BOOLEAN;
+    case "STRING":
+    case "VARCHAR":
+      return Type.STRING;
+    case "INTEGER":
+    case "INT":
+    case "SIGNED INTEGER":
+    case "INTEGER64":
+    case "INT64":
+      return Type.LONG;
+    case "FLOAT":
+    case "FLOAT64":
+      return Type.DOUBLE;
+    case "DATE":
+      return Type.DATE;
+    case "LOCAL DATETIME":
+    case "TIMESTAMP WITHOUT TIMEZONE":
+    case "TIMESTAMP WITHOUT TIME ZONE":
+      return Type.DATETIME;
+    case "ZONED DATETIME":
+    case "TIMESTAMP WITH TIMEZONE":
+    case "TIMESTAMP WITH TIME ZONE":
+      return Type.DATETIME;
+    case "LOCAL TIME":
+    case "TIME WITHOUT TIMEZONE":
+    case "TIME WITHOUT TIME ZONE":
+      return Type.STRING;
+    case "ZONED TIME":
+    case "TIME WITH TIMEZONE":
+    case "TIME WITH TIME ZONE":
+      return Type.STRING;
+    case "DURATION":
+      return Type.LONG;
+    case "LIST":
+      return Type.LIST;
+    case "MAP":
+      return Type.MAP;
+    case "POINT":
+      return Type.STRING;
+    default:
+      throw new CommandParsingException("Unsupported Cypher type in IS TYPED constraint: " + cypherType);
     }
   }
 
@@ -379,6 +457,41 @@ public class OpenCypherQueryEngine implements QueryEngine {
         schema.dropIndex(constraintName);
     } else {
       schema.dropIndex(constraintName);
+    }
+  }
+
+  private void executeCreateIndex(final CypherDDLStatement ddl, final Schema schema) {
+    final String typeName = ddl.getLabelName();
+    final String[] propertyNames = ddl.getPropertyNames().toArray(new String[0]);
+
+    // Auto-create the type if it doesn't exist (Cypher does not require types to be pre-declared)
+    if (!schema.existsType(typeName)) {
+      if (ddl.isForRelationship())
+        schema.getOrCreateEdgeType(typeName);
+      else
+        schema.getOrCreateVertexType(typeName);
+    }
+
+    // Ensure all properties exist before creating indexes (ArcadeDB requires this)
+    for (final String propName : propertyNames) {
+      if (schema.getType(typeName).getPropertyIfExists(propName) == null)
+        schema.getType(typeName).createProperty(propName, Type.STRING);
+    }
+
+    schema.buildTypeIndex(typeName, propertyNames)
+        .withType(Schema.INDEX_TYPE.LSM_TREE)
+        .withUnique(false)
+        .withIgnoreIfExists(ddl.isIfNotExists())
+        .create();
+  }
+
+  private void executeDropIndex(final CypherDDLStatement ddl, final Schema schema) {
+    final String indexName = ddl.getConstraintName();
+    if (ddl.isIfExists()) {
+      if (schema.existsIndex(indexName))
+        schema.dropIndex(indexName);
+    } else {
+      schema.dropIndex(indexName);
     }
   }
 

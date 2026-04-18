@@ -19,12 +19,18 @@
 package com.arcadedb.graph.olap;
 
 import com.arcadedb.graph.Vertex;
+import com.arcadedb.graph.Vertex.DIRECTION;
 
+import com.arcadedb.query.QueryEngineManager;
+
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Arrays;
 import java.util.PriorityQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLongArray;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 /**
@@ -52,7 +58,12 @@ public final class GraphAlgorithms {
   private static final int PARALLELISM           = Runtime.getRuntime().availableProcessors();
   private static final int PARALLEL_THRESHOLD     = 8192;
   private static final int PARALLEL_BFS_THRESHOLD = 4096;
-  private static final int PULL_DIRECTION_DIVISOR = 20; // switch to pull when frontier > n/20
+  private static final double ALPHA              = 8.0;  // edge ratio for push->pull switch
+  private static final int PULL_ENTER_DIVISOR    = 8;    // push->pull when frontier > n/8
+  private static final int PULL_EXIT_DIVISOR     = 512;  // pull->push when frontier < n/512
+
+  // VarHandle for lock-free CAS on long[] bitmap in parallel push mode
+  private static final VarHandle LONG_ARRAY_VH = MethodHandles.arrayElementVarHandle(long[].class);
 
   private GraphAlgorithms() {
   }
@@ -60,75 +71,53 @@ public final class GraphAlgorithms {
   // --- Parallel Infrastructure ---
 
   /**
-   * Partitions range [0, n) into chunks and runs each on a dedicated thread.
+   * Partitions range [0, n) into chunks and submits each to the shared query-engine pool.
+   * The calling thread always runs chunk 0 itself to avoid pool-starvation deadlock
+   * when invoked from within a pool thread (e.g., during query execution).
    * Falls back to single-threaded execution when n is below threshold.
-   * Propagates any exception thrown by a worker to the calling thread.
    */
   static void parallelForRange(final int n, final BiConsumer<Integer, Integer> work) {
     if (n < PARALLEL_THRESHOLD) {
       work.accept(0, n);
       return;
     }
+    final ExecutorService executor = QueryEngineManager.getInstance().getExecutorService();
     final int chunkSize = (n + PARALLELISM - 1) / PARALLELISM;
-    final Thread[] threads = new Thread[PARALLELISM];
-    final AtomicReference<Throwable> firstError = new AtomicReference<>();
+    final Future<?>[] futures = new Future<?>[PARALLELISM - 1];
     int launched = 0;
-    for (int t = 0; t < PARALLELISM; t++) {
+    for (int t = 1; t < PARALLELISM; t++) {
       final int start = t * chunkSize;
       final int end = Math.min(start + chunkSize, n);
       if (start >= n)
         break;
-      final Thread thread = new Thread(() -> {
-        try {
-          work.accept(start, end);
-        } catch (final Throwable e) {
-          firstError.compareAndSet(null, e);
-        }
-      });
-      thread.setDaemon(true);
-      thread.setName("gav-algo-" + t);
-      threads[t] = thread;
-      thread.start();
-      launched++;
+      futures[launched++] = executor.submit(() -> work.accept(start, end));
     }
-    joinThreads(threads, launched);
-    rethrowIfFailed(firstError);
+    // Calling thread runs chunk 0 — prevents deadlock when caller is a pool thread
+    work.accept(0, Math.min(chunkSize, n));
+    awaitFutures(futures, launched);
   }
 
   /**
-   * Creates a named daemon thread for algorithm parallelism.
+   * Waits for all submitted futures to complete and rethrows the first exception if any.
    */
-  static Thread newAlgoThread(final int index, final AtomicReference<Throwable> firstError, final Runnable task) {
-    final Thread thread = new Thread(() -> {
+  static void awaitFutures(final Future<?>[] futures, final int count) {
+    Throwable firstError = null;
+    for (int i = 0; i < count; i++) {
       try {
-        task.run();
-      } catch (final Throwable e) {
-        firstError.compareAndSet(null, e);
+        futures[i].get();
+      } catch (final ExecutionException e) {
+        if (firstError == null)
+          firstError = e.getCause();
+      } catch (final InterruptedException e) {
+        Thread.currentThread().interrupt();
       }
-    });
-    thread.setDaemon(true);
-    thread.setName("gav-algo-" + index);
-    return thread;
-  }
-
-  private static void joinThreads(final Thread[] threads, final int count) {
-    for (int i = 0; i < count; i++)
-      if (threads[i] != null)
-        try {
-          threads[i].join();
-        } catch (final InterruptedException e) {
-          Thread.currentThread().interrupt();
-        }
-  }
-
-  private static void rethrowIfFailed(final AtomicReference<Throwable> firstError) {
-    final Throwable t = firstError.get();
-    if (t != null) {
-      if (t instanceof RuntimeException)
-        throw (RuntimeException) t;
-      if (t instanceof Error)
-        throw (Error) t;
-      throw new RuntimeException(t);
+    }
+    if (firstError != null) {
+      if (firstError instanceof RuntimeException re)
+        throw re;
+      if (firstError instanceof Error er)
+        throw er;
+      throw new RuntimeException(firstError);
     }
   }
 
@@ -136,21 +125,27 @@ public final class GraphAlgorithms {
 
   /**
    * Computes PageRank over the given view for the specified edge types.
-   * Uses pull-based iteration: each node reads contributions FROM its in-neighbors
-   * via backward CSR. Each thread writes to a disjoint range of the next[] array,
+   * Uses pull-based iteration: each node reads contributions FROM its neighbors
+   * via CSR arrays. Each thread writes to a disjoint range of the next[] array,
    * requiring zero synchronization.
+   * <p>
+   * When direction is OUT (directed), out-degree uses forward CSR and pull reads backward CSR.
+   * When direction is BOTH (undirected), out-degree uses forward+backward CSR and pull reads both.
    *
    * @param view       the analytical view (must be built)
    * @param damping    damping factor, typically 0.85
    * @param iterations number of power-iteration steps
+   * @param direction  edge direction: OUT for directed, BOTH for undirected
    * @param edgeTypes  edge types to traverse (null or empty = all)
    * @return double[] of ranks indexed by dense node ID
    */
   public static double[] pageRank(final GraphAnalyticalView view, final double damping,
-      final int iterations, final String... edgeTypes) {
+      final int iterations, final DIRECTION direction, final String... edgeTypes) {
     final int n = view.getNodeMapping().size();
     if (n == 0)
       return new double[0];
+
+    final boolean undirected = direction == DIRECTION.BOTH;
 
     double[] rank = new double[n];
     double[] next = new double[n];
@@ -159,51 +154,98 @@ public final class GraphAlgorithms {
 
     final String[] types = resolveEdgeTypes(view, edgeTypes);
 
-    // Precompute outDegree array across all edge types (once, outside iteration loop)
-    final int[] outDeg = new int[n];
-    for (final String edgeType : types) {
-      final CSRAdjacencyIndex csr = view.getCSRIndex(edgeType);
+    // Pre-hoist CSR arrays outside the iteration loop to avoid repeated HashMap lookups
+    final int typeCount = types.length;
+    final int[][] allFwdOffsets = new int[typeCount][];
+    final int[][] allFwdNeighbors = new int[typeCount][];
+    final int[][] allBwdOffsets = new int[typeCount][];
+    final int[][] allBwdNeighbors = new int[typeCount][];
+    for (int t = 0; t < typeCount; t++) {
+      final CSRAdjacencyIndex csr = view.getCSRIndex(types[t]);
       if (csr == null)
         continue;
-      final int[] fwdOffsets = csr.getForwardOffsets();
-      for (int u = 0; u < n; u++)
-        outDeg[u] += fwdOffsets[u + 1] - fwdOffsets[u];
+      allFwdOffsets[t] = csr.getForwardOffsets();
+      allFwdNeighbors[t] = csr.getForwardNeighbors();
+      allBwdOffsets[t] = csr.getBackwardOffsets();
+      allBwdNeighbors[t] = csr.getBackwardNeighbors();
     }
+
+    // Precompute outDegree array across all edge types (once, outside iteration loop)
+    final int[] outDeg = new int[n];
+    for (int t = 0; t < typeCount; t++) {
+      if (allFwdOffsets[t] != null) {
+        final int[] fwdOffsets = allFwdOffsets[t];
+        for (int u = 0; u < n; u++)
+          outDeg[u] += fwdOffsets[u + 1] - fwdOffsets[u];
+      }
+      if (undirected && allBwdOffsets[t] != null) {
+        final int[] bwdOffsets = allBwdOffsets[t];
+        for (int u = 0; u < n; u++)
+          outDeg[u] += bwdOffsets[u + 1] - bwdOffsets[u];
+      }
+    }
+
+    // Pre-compute 1/outDeg to replace division with multiplication in the hot loop
+    final double[] invDeg = new double[n];
+    for (int u = 0; u < n; u++)
+      invDeg[u] = outDeg[u] > 0 ? 1.0 / outDeg[u] : 0.0;
+
+    // Pre-collect dangling node IDs (zero out-degree) for fast iteration
+    int danglingCount = 0;
+    for (int u = 0; u < n; u++)
+      if (outDeg[u] == 0)
+        danglingCount++;
+    final int[] danglingNodes = new int[danglingCount];
+    int dIdx = 0;
+    for (int u = 0; u < n; u++)
+      if (outDeg[u] == 0)
+        danglingNodes[dIdx++] = u;
 
     for (int iter = 0; iter < iterations; iter++) {
       final double base = (1.0 - damping) / n;
       final double[] currentRank = rank;
       final double[] nextRank = next;
 
-      // PULL: each node sums contributions from backward neighbors — parallel, zero sync
+      // Pre-compute contribution per node: rank[v] / outDeg[v].
+      // This turns the inner loop into a single gather+accumulate with no arithmetic.
+      final double[] contrib = new double[n];
+      parallelForRange(n, (s, e) -> {
+        for (int u = s; u < e; u++)
+          contrib[u] = currentRank[u] * invDeg[u];
+      });
+
+      // PULL: each node sums contributions from neighbors — parallel, zero sync
       parallelForRange(n, (start, end) -> {
         for (int u = start; u < end; u++) {
           double sum = 0;
-          for (final String edgeType : types) {
-            final CSRAdjacencyIndex csr = view.getCSRIndex(edgeType);
-            if (csr == null)
-              continue;
-            final int[] bwdOffsets = csr.getBackwardOffsets();
-            final int[] bwdNeighbors = csr.getBackwardNeighbors();
-            for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++) {
-              final int v = bwdNeighbors[j];
-              if (outDeg[v] > 0)
-                sum += currentRank[v] / outDeg[v];
+          for (int t = 0; t < typeCount; t++) {
+            if (allBwdOffsets[t] != null) {
+              final int[] bwdOffsets = allBwdOffsets[t];
+              final int[] bwdNeighbors = allBwdNeighbors[t];
+              for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++)
+                sum += contrib[bwdNeighbors[j]];
+            }
+            if (undirected && allFwdOffsets[t] != null) {
+              final int[] fwdOffsets = allFwdOffsets[t];
+              final int[] fwdNeighbors = allFwdNeighbors[t];
+              for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++)
+                sum += contrib[fwdNeighbors[j]];
             }
           }
           nextRank[u] = base + damping * sum;
         }
       });
 
-      // Handle dangling nodes: distribute their rank evenly (sequential, O(n))
+      // Handle dangling nodes: distribute their rank evenly
       double danglingSum = 0.0;
-      for (int u = 0; u < n; u++)
-        if (outDeg[u] == 0)
-          danglingSum += currentRank[u];
+      for (int i = 0; i < danglingNodes.length; i++)
+        danglingSum += currentRank[danglingNodes[i]];
       if (danglingSum > 0.0) {
         final double danglingContrib = damping * danglingSum / n;
-        for (int u = 0; u < n; u++)
-          nextRank[u] += danglingContrib;
+        parallelForRange(n, (s, e) -> {
+          for (int u = s; u < e; u++)
+            nextRank[u] += danglingContrib;
+        });
       }
 
       // Swap
@@ -215,10 +257,18 @@ public final class GraphAlgorithms {
   }
 
   /**
-   * Computes PageRank with default parameters: damping=0.85, iterations=20.
+   * Computes PageRank over the given view for the specified edge types using directed (OUT) semantics.
+   */
+  public static double[] pageRank(final GraphAnalyticalView view, final double damping,
+      final int iterations, final String... edgeTypes) {
+    return pageRank(view, damping, iterations, DIRECTION.OUT, edgeTypes);
+  }
+
+  /**
+   * Computes PageRank with default parameters: damping=0.85, iterations=20, direction=OUT.
    */
   public static double[] pageRank(final GraphAnalyticalView view, final String... edgeTypes) {
-    return pageRank(view, 0.85, 20, edgeTypes);
+    return pageRank(view, 0.85, 20, DIRECTION.OUT, edgeTypes);
   }
 
   // --- Connected Components (Parallel Min-Label Propagation) ---
@@ -246,6 +296,22 @@ public final class GraphAlgorithms {
 
     final String[] types = resolveEdgeTypes(view, edgeTypes);
 
+    // Pre-hoist CSR arrays outside the convergence loop to avoid repeated HashMap lookups
+    final int typeCount = types.length;
+    final int[][] allFwdOffsets = new int[typeCount][];
+    final int[][] allFwdNeighbors = new int[typeCount][];
+    final int[][] allBwdOffsets = new int[typeCount][];
+    final int[][] allBwdNeighbors = new int[typeCount][];
+    for (int t = 0; t < typeCount; t++) {
+      final CSRAdjacencyIndex csr = view.getCSRIndex(types[t]);
+      if (csr == null)
+        continue;
+      allFwdOffsets[t] = csr.getForwardOffsets();
+      allFwdNeighbors[t] = csr.getForwardNeighbors();
+      allBwdOffsets[t] = csr.getBackwardOffsets();
+      allBwdNeighbors[t] = csr.getBackwardNeighbors();
+    }
+
     boolean changed = true;
     while (changed) {
       System.arraycopy(label, 0, newLabel, 0, n);
@@ -255,23 +321,24 @@ public final class GraphAlgorithms {
         boolean localChanged = false;
         for (int u = start; u < end; u++) {
           int minLabel = label[u];
-          for (final String edgeType : types) {
-            final CSRAdjacencyIndex csr = view.getCSRIndex(edgeType);
-            if (csr == null)
-              continue;
-            final int[] fwdOffsets = csr.getForwardOffsets();
-            final int[] fwdNeighbors = csr.getForwardNeighbors();
-            for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++) {
-              final int nl = label[fwdNeighbors[j]];
-              if (nl < minLabel)
-                minLabel = nl;
+          for (int t = 0; t < typeCount; t++) {
+            if (allFwdOffsets[t] != null) {
+              final int[] fwdOffsets = allFwdOffsets[t];
+              final int[] fwdNeighbors = allFwdNeighbors[t];
+              for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++) {
+                final int nl = label[fwdNeighbors[j]];
+                if (nl < minLabel)
+                  minLabel = nl;
+              }
             }
-            final int[] bwdOffsets = csr.getBackwardOffsets();
-            final int[] bwdNeighbors = csr.getBackwardNeighbors();
-            for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++) {
-              final int nl = label[bwdNeighbors[j]];
-              if (nl < minLabel)
-                minLabel = nl;
+            if (allBwdOffsets[t] != null) {
+              final int[] bwdOffsets = allBwdOffsets[t];
+              final int[] bwdNeighbors = allBwdNeighbors[t];
+              for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++) {
+                final int nl = label[bwdNeighbors[j]];
+                if (nl < minLabel)
+                  minLabel = nl;
+              }
             }
           }
           newLabel[u] = minLabel;
@@ -417,8 +484,9 @@ public final class GraphAlgorithms {
    * Returns the full distance array from a source node to all reachable nodes.
    * Unreachable nodes have distance -1.
    * <p>
-   * Parallelizes frontier expansion when frontier exceeds threshold using
-   * AtomicLongArray bitmap CAS for thread-safe discovery and thread-local next-frontier buffers.
+   * Uses Beamer's direction-optimizing push/pull BFS with edge-count heuristic,
+   * hysteresis thresholds (separate enter/exit), and parallel pull mode.
+   * Push mode uses VarHandle CAS on the visited bitmap for lock-free thread safety.
    */
   public static int[] shortestPathAll(final GraphAnalyticalView view, final int source,
       final Vertex.DIRECTION direction, final String... edgeTypes) {
@@ -451,6 +519,24 @@ public final class GraphAlgorithms {
       allBwdOffsets[t] = csr.getBackwardOffsets();
       allBwdNeighbors[t] = csr.getBackwardNeighbors();
     }
+
+    // Precompute push-direction degree per node for edge-count heuristic
+    final int[] degree = new int[n];
+    long totalEdges = 0;
+    for (int t = 0; t < typeCount; t++) {
+      if (useFwd && allFwdOffsets[t] != null) {
+        final int[] off = allFwdOffsets[t];
+        for (int i = 0; i < n; i++)
+          degree[i] += off[i + 1] - off[i];
+      }
+      if (useBwd && allBwdOffsets[t] != null) {
+        final int[] off = allBwdOffsets[t];
+        for (int i = 0; i < n; i++)
+          degree[i] += off[i + 1] - off[i];
+      }
+    }
+    for (int i = 0; i < n; i++)
+      totalEdges += degree[i];
 
     // dist[] for output, bitmap for fast visited check in hot loop
     final int[] dist = new int[n];
@@ -496,75 +582,195 @@ public final class GraphAlgorithms {
       }
     }
 
-    // Pull mode only beneficial for large enough graphs and frontiers
-    final int pullThreshold = n >= PULL_DIRECTION_DIVISOR * 2 ? n / PULL_DIRECTION_DIVISOR : Integer.MAX_VALUE;
+    // Edge-count heuristic state (Beamer's direction-optimizing BFS)
+    final int pullEnterThreshold = n / PULL_ENTER_DIVISOR;
+    final int pullExitThreshold = n / PULL_EXIT_DIVISOR;
+    boolean inPullMode = false;
+    long visitedEdges = degree[source];
+    long edgesInFrontier = degree[source];
+    int prevFrontierSize = 1;
 
     while (frontierSize > 0) {
       depth++;
 
-      if (frontierSize > pullThreshold) {
+      // Direction-optimizing switch using edge-count heuristic with hysteresis
+      final long edgesUnexplored = totalEdges - visitedEdges;
+      final boolean frontierGrowing = frontierSize >= prevFrontierSize;
+      if (inPullMode) {
+        // Stay in pull unless frontier is small and shrinking
+        if (!frontierGrowing && frontierSize <= pullExitThreshold)
+          inPullMode = false;
+      } else {
+        // Switch to pull when frontier is large and edge-dense
+        if (frontierSize > pullEnterThreshold && edgesInFrontier > edgesUnexplored / ALPHA)
+          inPullMode = true;
+      }
+
+      prevFrontierSize = frontierSize;
+      long nextEdgesInFrontier = 0;
+
+      if (inPullMode) {
         // PULL mode: scan ALL unvisited nodes, check if any reverse-neighbor is in frontier.
-        // Breaks early after finding one parent — skips rest of adjacency list.
-        // Advantage: for large frontiers, most neighbors are in the frontier, so early break
-        // avoids scanning thousands of already-visited neighbors per high-degree node.
-        int nextSize = 0;
-        for (int v = 0; v < n; v++) {
-          final int vWord = v >>> 6;
-          final long vBit = 1L << (v & 63);
-          if ((visited[vWord] & vBit) != 0)
-            continue; // already visited
+        // Parallelized: each thread handles a disjoint node range — no synchronization needed.
+        // Breaks early after finding one parent per node.
+        final int currentDepth = depth;
+        final int numThreads = Math.min(PARALLELISM, Math.max(1, (n + PARALLEL_THRESHOLD - 1) / PARALLEL_THRESHOLD));
 
-          boolean found = false;
-          for (int t = 0; t < typeCount && !found; t++) {
-            if (pullOffsets1[t] != null) {
-              final int[] offsets = pullOffsets1[t];
-              final int[] neighbors = pullNeighbors1[t];
-              for (int j = offsets[v], end = offsets[v + 1]; j < end; j++) {
-                final int u = neighbors[j];
-                if ((frontierBitmap[u >>> 6] & (1L << (u & 63))) != 0) {
-                  found = true;
-                  break;
+        if (numThreads <= 1) {
+          // Sequential pull (small graph)
+          int nextSize = 0;
+          for (int v = 0; v < n; v++) {
+            final int vWord = v >>> 6;
+            final long vBit = 1L << (v & 63);
+            if ((visited[vWord] & vBit) != 0)
+              continue;
+
+            boolean found = false;
+            for (int t = 0; t < typeCount && !found; t++) {
+              if (pullOffsets1[t] != null) {
+                final int[] offsets = pullOffsets1[t];
+                final int[] neighbors = pullNeighbors1[t];
+                for (int j = offsets[v], end = offsets[v + 1]; j < end; j++) {
+                  if ((frontierBitmap[neighbors[j] >>> 6] & (1L << (neighbors[j] & 63))) != 0) {
+                    found = true;
+                    break;
+                  }
+                }
+              }
+              if (!found && pullOffsets2[t] != null) {
+                final int[] offsets = pullOffsets2[t];
+                final int[] neighbors = pullNeighbors2[t];
+                for (int j = offsets[v], end = offsets[v + 1]; j < end; j++) {
+                  if ((frontierBitmap[neighbors[j] >>> 6] & (1L << (neighbors[j] & 63))) != 0) {
+                    found = true;
+                    break;
+                  }
                 }
               }
             }
-            if (!found && pullOffsets2[t] != null) {
-              final int[] offsets = pullOffsets2[t];
-              final int[] neighbors = pullNeighbors2[t];
-              for (int j = offsets[v], end = offsets[v + 1]; j < end; j++) {
-                final int u = neighbors[j];
-                if ((frontierBitmap[u >>> 6] & (1L << (u & 63))) != 0) {
-                  found = true;
-                  break;
-                }
-              }
+            if (found) {
+              visited[vWord] |= vBit;
+              dist[v] = currentDepth;
+              nextFrontier[nextSize++] = v;
+              nextEdgesInFrontier += degree[v];
             }
           }
-          if (found) {
-            visited[vWord] |= vBit;
-            dist[v] = depth;
-            nextFrontier[nextSize++] = v;
+
+          Arrays.fill(frontierBitmap, 0L);
+          for (int i = 0; i < nextSize; i++) {
+            final int v = nextFrontier[i];
+            frontierBitmap[v >>> 6] |= 1L << (v & 63);
           }
-        }
+          final int[] tmp = frontier;
+          frontier = nextFrontier;
+          nextFrontier = tmp;
+          frontierSize = nextSize;
 
-        // Update frontier bitmap: clear old frontier, set new frontier
-        Arrays.fill(frontierBitmap, 0L);
-        for (int i = 0; i < nextSize; i++) {
-          final int v = nextFrontier[i];
-          frontierBitmap[v >>> 6] |= 1L << (v & 63);
-        }
+        } else {
+          // Parallel pull: each thread scans a disjoint range of unvisited nodes
+          final int chunkSize = (n + numThreads - 1) / numThreads;
+          final int[][] localNexts = new int[numThreads][];
+          final int[] localSizes = new int[numThreads];
+          final long[] localEdges = new long[numThreads];
 
-        // Swap frontier references
-        final int[] tmp = frontier;
-        frontier = nextFrontier;
-        nextFrontier = tmp;
-        frontierSize = nextSize;
+          final ExecutorService executor = QueryEngineManager.getInstance().getExecutorService();
+          final Future<?>[] futures = new Future<?>[numThreads - 1];
+          int launched = 0;
+          Runnable callerTask = null;
+          for (int thr = 0; thr < numThreads; thr++) {
+            final int tIdx = thr;
+            final int tStart = thr * chunkSize;
+            final int tEnd = Math.min(tStart + chunkSize, n);
+            if (tStart >= n)
+              break;
+            final Runnable task = () -> {
+              int[] localNext = new int[Math.min(n, (tEnd - tStart) / 4 + 64)];
+              int localSize = 0;
+              long localEdgeSum = 0;
+              for (int v = tStart; v < tEnd; v++) {
+                final int vWord = v >>> 6;
+                final long vBit = 1L << (v & 63);
+                if ((visited[vWord] & vBit) != 0)
+                  continue;
+                boolean found = false;
+                for (int t = 0; t < typeCount && !found; t++) {
+                  if (pullOffsets1[t] != null) {
+                    final int[] offsets = pullOffsets1[t];
+                    final int[] neighbors = pullNeighbors1[t];
+                    for (int j = offsets[v], end = offsets[v + 1]; j < end; j++) {
+                      if ((frontierBitmap[neighbors[j] >>> 6] & (1L << (neighbors[j] & 63))) != 0) {
+                        found = true;
+                        break;
+                      }
+                    }
+                  }
+                  if (!found && pullOffsets2[t] != null) {
+                    final int[] offsets = pullOffsets2[t];
+                    final int[] neighbors = pullNeighbors2[t];
+                    for (int j = offsets[v], end = offsets[v + 1]; j < end; j++) {
+                      if ((frontierBitmap[neighbors[j] >>> 6] & (1L << (neighbors[j] & 63))) != 0) {
+                        found = true;
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (found) {
+                  dist[v] = currentDepth;
+                  if (localSize >= localNext.length)
+                    localNext = Arrays.copyOf(localNext, Math.min(n, localNext.length * 2));
+                  localNext[localSize++] = v;
+                  localEdgeSum += degree[v];
+                }
+              }
+              localNexts[tIdx] = localNext;
+              localSizes[tIdx] = localSize;
+              localEdges[tIdx] = localEdgeSum;
+            };
+            if (callerTask == null)
+              callerTask = task;
+            else
+              futures[launched++] = executor.submit(task);
+          }
+          // Calling thread runs chunk 0 — prevents pool-starvation deadlock
+          if (callerTask != null)
+            callerTask.run();
+          awaitFutures(futures, launched);
+
+          // Merge thread-local results
+          int totalNext = 0;
+          for (int t = 0; t < numThreads; t++) {
+            if (localNexts[t] == null)
+              continue;
+            totalNext += localSizes[t];
+            nextEdgesInFrontier += localEdges[t];
+          }
+          int pos = 0;
+          for (int t = 0; t < numThreads; t++)
+            if (localNexts[t] != null && localSizes[t] > 0) {
+              System.arraycopy(localNexts[t], 0, nextFrontier, pos, localSizes[t]);
+              pos += localSizes[t];
+            }
+
+          // Update visited and frontier bitmaps after merge (sequential, no atomics)
+          for (int i = 0; i < totalNext; i++) {
+            final int v = nextFrontier[i];
+            visited[v >>> 6] |= 1L << (v & 63);
+          }
+          Arrays.fill(frontierBitmap, 0L);
+          for (int i = 0; i < totalNext; i++) {
+            final int v = nextFrontier[i];
+            frontierBitmap[v >>> 6] |= 1L << (v & 63);
+          }
+
+          final int[] tmp = frontier;
+          frontier = nextFrontier;
+          nextFrontier = tmp;
+          frontierSize = totalNext;
+        }
 
       } else if (frontierSize > PARALLEL_BFS_THRESHOLD) {
-        // PUSH mode (parallel): expand frontier outward using threads
-        final AtomicLongArray visitedAtomic = new AtomicLongArray(visited.length);
-        for (int i = 0; i < visited.length; i++)
-          visitedAtomic.set(i, visited[i]);
-
+        // PUSH mode (parallel): expand frontier using VarHandle CAS on visited bitmap
         final int fSize = frontierSize;
         final int[] currentFrontier = frontier;
         final int currentDepth = depth;
@@ -572,19 +778,22 @@ public final class GraphAlgorithms {
         final int chunkSize = (fSize + numThreads - 1) / numThreads;
         final int[][] localNexts = new int[numThreads][];
         final int[] localSizes = new int[numThreads];
+        final long[] localEdges = new long[numThreads];
 
-        final Thread[] threads = new Thread[numThreads];
-        final AtomicReference<Throwable> bfsError = new AtomicReference<>();
+        final ExecutorService executor = QueryEngineManager.getInstance().getExecutorService();
+        final Future<?>[] futures = new Future<?>[numThreads - 1];
         int launched = 0;
+        Runnable callerTask = null;
         for (int t = 0; t < numThreads; t++) {
           final int tIdx = t;
           final int tStart = t * chunkSize;
           final int tEnd = Math.min(tStart + chunkSize, fSize);
           if (tStart >= fSize)
             break;
-          threads[t] = newAlgoThread(t, bfsError, () -> {
+          final Runnable task = () -> {
             int[] localNext = new int[Math.min(n, (tEnd - tStart) * 8)];
             int localSize = 0;
+            long localEdgeSum = 0;
             for (int f = tStart; f < tEnd; f++) {
               final int u = currentFrontier[f];
               for (int ti = 0; ti < typeCount; ti++) {
@@ -597,15 +806,16 @@ public final class GraphAlgorithms {
                     final long bit = 1L << (v & 63);
                     long oldVal;
                     do {
-                      oldVal = visitedAtomic.get(word);
+                      oldVal = (long) LONG_ARRAY_VH.getVolatile(visited, word);
                       if ((oldVal & bit) != 0)
                         break;
-                    } while (!visitedAtomic.compareAndSet(word, oldVal, oldVal | bit));
+                    } while (!LONG_ARRAY_VH.compareAndSet(visited, word, oldVal, oldVal | bit));
                     if ((oldVal & bit) == 0) {
                       dist[v] = currentDepth;
                       if (localSize >= localNext.length)
                         localNext = Arrays.copyOf(localNext, Math.min(n, localNext.length * 2));
                       localNext[localSize++] = v;
+                      localEdgeSum += degree[v];
                     }
                   }
                 }
@@ -618,15 +828,16 @@ public final class GraphAlgorithms {
                     final long bit = 1L << (v & 63);
                     long oldVal;
                     do {
-                      oldVal = visitedAtomic.get(word);
+                      oldVal = (long) LONG_ARRAY_VH.getVolatile(visited, word);
                       if ((oldVal & bit) != 0)
                         break;
-                    } while (!visitedAtomic.compareAndSet(word, oldVal, oldVal | bit));
+                    } while (!LONG_ARRAY_VH.compareAndSet(visited, word, oldVal, oldVal | bit));
                     if ((oldVal & bit) == 0) {
                       dist[v] = currentDepth;
                       if (localSize >= localNext.length)
                         localNext = Arrays.copyOf(localNext, Math.min(n, localNext.length * 2));
                       localNext[localSize++] = v;
+                      localEdgeSum += degree[v];
                     }
                   }
                 }
@@ -634,24 +845,27 @@ public final class GraphAlgorithms {
             }
             localNexts[tIdx] = localNext;
             localSizes[tIdx] = localSize;
-          });
-          threads[t].start();
-          launched++;
+            localEdges[tIdx] = localEdgeSum;
+          };
+          if (callerTask == null)
+            callerTask = task;
+          else
+            futures[launched++] = executor.submit(task);
         }
-        joinThreads(threads, launched);
-        rethrowIfFailed(bfsError);
+        // Calling thread runs chunk 0 — prevents pool-starvation deadlock
+        if (callerTask != null)
+          callerTask.run();
+        awaitFutures(futures, launched);
 
-        // Copy atomic bitmap back to plain bitmap for next iteration
-        for (int i = 0; i < visited.length; i++)
-          visited[i] = visitedAtomic.get(i);
-
-        // Merge thread-local frontiers into pre-allocated nextFrontier
+        // Merge thread-local frontiers
         int totalNext = 0;
-        for (int t = 0; t < launched; t++)
-          if (localNexts[t] != null)
+        for (int t = 0; t < numThreads; t++)
+          if (localNexts[t] != null) {
             totalNext += localSizes[t];
+            nextEdgesInFrontier += localEdges[t];
+          }
         int pos = 0;
-        for (int t = 0; t < launched; t++)
+        for (int t = 0; t < numThreads; t++)
           if (localNexts[t] != null && localSizes[t] > 0) {
             System.arraycopy(localNexts[t], 0, nextFrontier, pos, localSizes[t]);
             pos += localSizes[t];
@@ -664,7 +878,6 @@ public final class GraphAlgorithms {
           frontierBitmap[v >>> 6] |= 1L << (v & 63);
         }
 
-        // Swap frontier references
         final int[] tmp = frontier;
         frontier = nextFrontier;
         nextFrontier = tmp;
@@ -687,6 +900,7 @@ public final class GraphAlgorithms {
                   visited[word] |= bit;
                   dist[v] = depth;
                   nextFrontier[nextSize++] = v;
+                  nextEdgesInFrontier += degree[v];
                 }
               }
             }
@@ -701,6 +915,7 @@ public final class GraphAlgorithms {
                   visited[word] |= bit;
                   dist[v] = depth;
                   nextFrontier[nextSize++] = v;
+                  nextEdgesInFrontier += degree[v];
                 }
               }
             }
@@ -714,12 +929,15 @@ public final class GraphAlgorithms {
           frontierBitmap[v >>> 6] |= 1L << (v & 63);
         }
 
-        // Swap frontier references
         final int[] tmp = frontier;
         frontier = nextFrontier;
         nextFrontier = tmp;
         frontierSize = nextSize;
       }
+
+      // Update edge-count tracking for next iteration
+      visitedEdges += nextEdgesInFrontier;
+      edgesInFrontier = nextEdgesInFrontier;
     }
 
     return dist;
@@ -888,14 +1106,31 @@ public final class GraphAlgorithms {
 
     final String[] types = resolveEdgeTypes(view, edgeTypes);
 
-    // Pre-compute max degree to size thread-local buffers
+    // Pre-hoist CSR arrays outside the iteration loop to avoid repeated HashMap lookups
+    final int typeCount = types.length;
+    final int[][] allFwdOffsets = new int[typeCount][];
+    final int[][] allFwdNeighbors = new int[typeCount][];
+    final int[][] allBwdOffsets = new int[typeCount][];
+    final int[][] allBwdNeighbors = new int[typeCount][];
+    for (int t = 0; t < typeCount; t++) {
+      final CSRAdjacencyIndex csr = view.getCSRIndex(types[t]);
+      if (csr == null)
+        continue;
+      allFwdOffsets[t] = csr.getForwardOffsets();
+      allFwdNeighbors[t] = csr.getForwardNeighbors();
+      allBwdOffsets[t] = csr.getBackwardOffsets();
+      allBwdNeighbors[t] = csr.getBackwardNeighbors();
+    }
+
+    // Pre-compute max degree using pre-hoisted arrays (avoid method calls in loop)
     int maxDegree = 0;
     for (int u = 0; u < n; u++) {
       int deg = 0;
-      for (final String edgeType : types) {
-        final CSRAdjacencyIndex csr = view.getCSRIndex(edgeType);
-        if (csr != null)
-          deg += csr.outDegree(u) + csr.inDegree(u);
+      for (int t = 0; t < typeCount; t++) {
+        if (allFwdOffsets[t] != null)
+          deg += allFwdOffsets[t][u + 1] - allFwdOffsets[t][u];
+        if (allBwdOffsets[t] != null)
+          deg += allBwdOffsets[t][u + 1] - allBwdOffsets[t][u];
       }
       if (deg > maxDegree)
         maxDegree = deg;
@@ -915,18 +1150,19 @@ public final class GraphAlgorithms {
         for (int u = start; u < end; u++) {
           // Collect neighbor labels into thread-local buffer
           int pos = 0;
-          for (final String edgeType : types) {
-            final CSRAdjacencyIndex csr = view.getCSRIndex(edgeType);
-            if (csr == null)
-              continue;
-            final int[] fwdOffsets = csr.getForwardOffsets();
-            final int[] fwdNeighbors = csr.getForwardNeighbors();
-            for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++)
-              neighborBuf[pos++] = labels[fwdNeighbors[j]];
-            final int[] bwdOffsets = csr.getBackwardOffsets();
-            final int[] bwdNeighbors = csr.getBackwardNeighbors();
-            for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++)
-              neighborBuf[pos++] = labels[bwdNeighbors[j]];
+          for (int t = 0; t < typeCount; t++) {
+            if (allFwdOffsets[t] != null) {
+              final int[] fwdOffsets = allFwdOffsets[t];
+              final int[] fwdNeighbors = allFwdNeighbors[t];
+              for (int j = fwdOffsets[u]; j < fwdOffsets[u + 1]; j++)
+                neighborBuf[pos++] = labels[fwdNeighbors[j]];
+            }
+            if (allBwdOffsets[t] != null) {
+              final int[] bwdOffsets = allBwdOffsets[t];
+              final int[] bwdNeighbors = allBwdNeighbors[t];
+              for (int j = bwdOffsets[u]; j < bwdOffsets[u + 1]; j++)
+                neighborBuf[pos++] = labels[bwdNeighbors[j]];
+            }
           }
 
           if (pos == 0)
@@ -1076,40 +1312,54 @@ public final class GraphAlgorithms {
       });
     }
 
-    // Count triangles — parallel per vertex (each triangles[u] is independent)
-    final long[] triangles = new long[n];
+    // Count triangles using the "forward" technique: for each edge (u, v) where v > u,
+    // count common neighbors w > v via sorted-merge intersection.
+    // Each triangle {u, v, w} is found exactly once (u < v < w), then credited to all 3 nodes.
+    // This halves the intersection work compared to counting from both directions.
+    // Uses AtomicLongArray for thread-safe increments on shared triangle counts.
+    final java.util.concurrent.atomic.AtomicLongArray triangles = new java.util.concurrent.atomic.AtomicLongArray(n);
     parallelForRange(n, (start, end) -> {
       for (int u = start; u < end; u++) {
         final int uStart = offsets[u];
         final int uEnd = offsets[u + 1];
-        long count = 0;
         for (int k = uStart; k < uEnd; k++) {
           final int v = neighbors[k];
+          if (v <= u)
+            continue;  // only process edges where v > u
+          // Intersect N(u) ∩ N(v) for neighbors w > v
           final int vStart = offsets[v];
           final int vEnd = offsets[v + 1];
-          int iu = uStart, iv = vStart;
+          int iu = k + 1;  // start after v in u's sorted list (all entries > v)
+          int iv = vStart;
+          // Advance iv past entries <= v
+          while (iv < vEnd && neighbors[iv] <= v)
+            iv++;
           while (iu < uEnd && iv < vEnd) {
-            if (neighbors[iu] < neighbors[iv])
+            final int nu = neighbors[iu];
+            final int nv = neighbors[iv];
+            if (nu < nv)
               iu++;
-            else if (neighbors[iu] > neighbors[iv])
+            else if (nu > nv)
               iv++;
             else {
-              count++;
+              // Triangle {u, v, nu} found — credit all three nodes atomically
+              triangles.incrementAndGet(u);
+              triangles.incrementAndGet(v);
+              triangles.incrementAndGet(nu);
               iu++;
               iv++;
             }
           }
         }
-        triangles[u] = count;
       }
     });
 
-    // Each triangle counted twice per node
+    // With forward counting, each triangle is found once and credited to all 3 nodes
     final double[] lcc = new double[n];
     for (int u = 0; u < n; u++) {
       final long deg = offsets[u + 1] - offsets[u];
       if (deg >= 2)
-        lcc[u] = (double) triangles[u] / (double) (deg * (deg - 1));
+        lcc[u] = (2.0 * triangles.get(u)) / (double) (deg * (deg - 1));
     }
     return lcc;
   }

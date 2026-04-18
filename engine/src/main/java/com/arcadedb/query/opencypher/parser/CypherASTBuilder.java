@@ -44,6 +44,7 @@ import com.arcadedb.query.opencypher.ast.MergeClause;
 import com.arcadedb.query.opencypher.ast.NodePattern;
 import com.arcadedb.query.opencypher.ast.OrderByClause;
 import com.arcadedb.query.opencypher.ast.ParameterExpression;
+import com.arcadedb.query.opencypher.ast.PathMode;
 import com.arcadedb.query.opencypher.ast.PathPattern;
 import com.arcadedb.query.opencypher.ast.PatternPredicateExpression;
 import com.arcadedb.query.opencypher.ast.PropertyAccessExpression;
@@ -124,17 +125,21 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
   private CypherStatement handleCreateCommand(final Cypher25Parser.CreateCommandContext ctx) {
     if (ctx.createConstraint() != null)
       return handleCreateConstraint(ctx.createConstraint());
+    if (ctx.createIndex() != null)
+      return handleCreateIndex(ctx.createIndex());
     if (ctx.createUser() != null)
       return handleCreateUser(ctx.createUser());
-    throw new CommandParsingException("Only CREATE CONSTRAINT and CREATE USER are currently supported");
+    throw new CommandParsingException("Only CREATE CONSTRAINT, CREATE INDEX and CREATE USER are currently supported");
   }
 
   private CypherStatement handleDropCommand(final Cypher25Parser.DropCommandContext ctx) {
     if (ctx.dropConstraint() != null)
       return handleDropConstraint(ctx.dropConstraint());
+    if (ctx.dropIndex() != null)
+      return handleDropIndex(ctx.dropIndex());
     if (ctx.dropUser() != null)
       return handleDropUser(ctx.dropUser());
-    throw new CommandParsingException("Only DROP CONSTRAINT and DROP USER are currently supported");
+    throw new CommandParsingException("Only DROP CONSTRAINT, DROP INDEX and DROP USER are currently supported");
   }
 
   private CypherAdminStatement handleShowCommand(final Cypher25Parser.ShowCommandContext ctx) {
@@ -221,17 +226,21 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
 
     // Determine constraint kind
     final CypherDDLStatement.ConstraintKind constraintKind;
+    String typedName = null;
     if (constraintType instanceof Cypher25Parser.ConstraintIsUniqueContext)
       constraintKind = CypherDDLStatement.ConstraintKind.UNIQUE;
     else if (constraintType instanceof Cypher25Parser.ConstraintIsNotNullContext)
       constraintKind = CypherDDLStatement.ConstraintKind.NOT_NULL;
     else if (constraintType instanceof Cypher25Parser.ConstraintKeyContext)
       constraintKind = CypherDDLStatement.ConstraintKind.KEY;
-    else
+    else if (constraintType instanceof Cypher25Parser.ConstraintTypedContext) {
+      constraintKind = CypherDDLStatement.ConstraintKind.TYPED;
+      typedName = extractCypherTypeName(((Cypher25Parser.ConstraintTypedContext) constraintType).type());
+    } else
       throw new CommandParsingException("Unsupported constraint type: " + constraintType.getText());
 
     return new CypherDDLStatement(CypherDDLStatement.Kind.CREATE_CONSTRAINT, constraintKind,
-        constraintName, labelName, propertyNames, ifNotExists, false, forRelationship);
+        constraintName, labelName, propertyNames, ifNotExists, false, forRelationship, typedName);
   }
 
   private CypherDDLStatement handleDropConstraint(final Cypher25Parser.DropConstraintContext ctx) {
@@ -239,6 +248,65 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     final boolean ifExists = ctx.IF() != null && ctx.EXISTS() != null;
     return new CypherDDLStatement(CypherDDLStatement.Kind.DROP_CONSTRAINT, null,
         constraintName, null, null, false, ifExists, false);
+  }
+
+  private CypherDDLStatement handleCreateIndex(final Cypher25Parser.CreateIndexContext ctx) {
+    // The grammar supports: INDEX, RANGE INDEX, TEXT INDEX, POINT INDEX, VECTOR INDEX, LOOKUP INDEX, FULLTEXT INDEX
+    // ArcadeDB maps all standard indexes to LSM_TREE
+    final Cypher25Parser.CreateIndex_Context indexCtx;
+    if (ctx.createIndex_() != null)
+      indexCtx = ctx.createIndex_();
+    else
+      throw new CommandParsingException("Only standard, RANGE and TEXT index types are supported");
+
+    // Extract optional index name
+    final String indexName = indexCtx.symbolicNameOrStringParameter() != null
+        ? stripBackticks(indexCtx.symbolicNameOrStringParameter().getText()) : null;
+
+    // IF NOT EXISTS
+    final boolean ifNotExists = indexCtx.IF() != null && indexCtx.NOT() != null && indexCtx.EXISTS() != null;
+
+    // Extract label name and determine if it's for a node or relationship
+    final boolean forRelationship;
+    final String labelName;
+    if (indexCtx.commandNodePattern() != null) {
+      forRelationship = false;
+      labelName = stripBackticks(indexCtx.commandNodePattern().labelType().symbolicNameString().getText());
+    } else if (indexCtx.commandRelPattern() != null) {
+      forRelationship = true;
+      labelName = stripBackticks(indexCtx.commandRelPattern().relType().symbolicNameString().getText());
+    } else {
+      throw new CommandParsingException("CREATE INDEX requires a node or relationship pattern");
+    }
+
+    // Extract property names from propertyList
+    final List<String> propertyNames = extractIndexPropertyNames(indexCtx.propertyList());
+
+    return new CypherDDLStatement(CypherDDLStatement.Kind.CREATE_INDEX, null,
+        indexName, labelName, propertyNames, ifNotExists, false, forRelationship);
+  }
+
+  private CypherDDLStatement handleDropIndex(final Cypher25Parser.DropIndexContext ctx) {
+    final String indexName = stripBackticks(ctx.symbolicNameOrStringParameter().getText());
+    final boolean ifExists = ctx.IF() != null && ctx.EXISTS() != null;
+    return new CypherDDLStatement(CypherDDLStatement.Kind.DROP_INDEX, null,
+        indexName, null, null, false, ifExists, false);
+  }
+
+  /**
+   * Extracts property names from a propertyList context (used by CREATE INDEX).
+   * Handles both single property (n.id) and property list ((n.first, n.last)).
+   */
+  private List<String> extractIndexPropertyNames(final Cypher25Parser.PropertyListContext propList) {
+    final List<String> names = new ArrayList<>();
+    if (propList.enclosedPropertyList() != null) {
+      final Cypher25Parser.EnclosedPropertyListContext enclosed = propList.enclosedPropertyList();
+      for (final Cypher25Parser.PropertyContext prop : enclosed.property())
+        names.add(stripBackticks(prop.propertyKeyName().getText()));
+    } else {
+      names.add(stripBackticks(propList.property().propertyKeyName().getText()));
+    }
+    return names;
   }
 
   /**
@@ -254,6 +322,8 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
       propList = ((Cypher25Parser.ConstraintIsNotNullContext) ctx).propertyList();
     else if (ctx instanceof Cypher25Parser.ConstraintKeyContext)
       propList = ((Cypher25Parser.ConstraintKeyContext) ctx).propertyList();
+    else if (ctx instanceof Cypher25Parser.ConstraintTypedContext)
+      propList = ((Cypher25Parser.ConstraintTypedContext) ctx).propertyList();
     else
       throw new CommandParsingException("Unsupported constraint type for property extraction");
 
@@ -268,6 +338,26 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
       names.add(stripBackticks(propList.property().propertyKeyName().getText()));
     }
     return names;
+  }
+
+  /**
+   * Extracts the Cypher type name from a type context (e.g., STRING, INTEGER, BOOLEAN, FLOAT, DATE, LOCAL DATETIME).
+   * Returns a normalized uppercase string that can be mapped to an ArcadeDB Type.
+   */
+  private String extractCypherTypeName(final Cypher25Parser.TypeContext typeCtx) {
+    // The type rule is: typePart (BAR typePart)* - we only support single types (no union types)
+    if (typeCtx.typePart().size() != 1)
+      throw new CommandParsingException("Union types are not supported in IS TYPED constraints");
+    final Cypher25Parser.TypePartContext typePart = typeCtx.typePart(0);
+    final Cypher25Parser.TypeNameContext typeName = typePart.typeName();
+    // Build the normalized type name from the tokens (e.g., "LOCAL DATETIME" has two tokens)
+    final StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < typeName.getChildCount(); i++) {
+      if (i > 0)
+        sb.append(' ');
+      sb.append(typeName.getChild(i).getText().toUpperCase());
+    }
+    return sb.toString();
   }
 
   @Override
@@ -603,21 +693,20 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
 
     // Parse return items
     final List<ReturnClause.ReturnItem> items = new ArrayList<>();
-    if (body.returnItems().TIMES() != null) {
-      // WITH *
+    if (body.returnItems().TIMES() != null)
+      // WITH * — pass all variables through
       items.add(new ReturnClause.ReturnItem(new VariableExpression("*"), "*"));
-    } else {
-      for (final Cypher25Parser.ReturnItemContext itemCtx : body.returnItems().returnItem()) {
-        // Pattern expressions (e.g., (n)-[]->()) are not allowed in WITH projections
-        if (findPatternExpressionRecursive(itemCtx.expression()) != null)
-          throw new CommandParsingException("UnexpectedSyntax: Pattern expressions are not allowed in WITH projections");
-        final Expression expr = expressionBuilder.parseExpression(itemCtx.expression());
-        final String alias = itemCtx.variable() != null ? stripBackticks(itemCtx.variable().getText()) : null;
-        final ReturnClause.ReturnItem item = new ReturnClause.ReturnItem(expr, alias);
-        if (alias == null)
-          item.setOriginalText(getOriginalText(itemCtx.expression()));
-        items.add(item);
-      }
+    // Always process explicit return items (handles both "WITH expr" and "WITH *, expr AS alias")
+    for (final Cypher25Parser.ReturnItemContext itemCtx : body.returnItems().returnItem()) {
+      // Pattern expressions (e.g., (n)-[]->()) are not allowed in WITH projections
+      if (findPatternExpressionRecursive(itemCtx.expression()) != null)
+        throw new CommandParsingException("UnexpectedSyntax: Pattern expressions are not allowed in WITH projections");
+      final Expression expr = expressionBuilder.parseExpression(itemCtx.expression());
+      final String alias = itemCtx.variable() != null ? stripBackticks(itemCtx.variable().getText()) : null;
+      final ReturnClause.ReturnItem item = new ReturnClause.ReturnItem(expr, alias);
+      if (alias == null)
+        item.setOriginalText(getOriginalText(itemCtx.expression()));
+      items.add(item);
     }
 
     // Parse DISTINCT flag
@@ -1094,6 +1183,34 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
       return createFallbackComparison(ctx);
     }
 
+    // Check if the expression is a list predicate (any/all/none/single) used as a boolean
+    final Cypher25Parser.ListItemsPredicateContext listPredCtx = expressionBuilder.findListItemsPredicateRecursive(expr6);
+    if (listPredCtx != null) {
+      final Expression listPredExpr = expressionBuilder.parseListItemsPredicate(listPredCtx);
+      return new BooleanExpression() {
+        @Override
+        public boolean evaluate(final Result result, final CommandContext context) {
+          final Object value = listPredExpr.evaluate(result, context);
+          return value instanceof Boolean && (Boolean) value;
+        }
+
+        @Override
+        public Object evaluateTernary(final Result result, final CommandContext context) {
+          final Object value = listPredExpr.evaluate(result, context);
+          if (value == null)
+            return null;
+          if (value instanceof Boolean)
+            return value;
+          return Boolean.TRUE;
+        }
+
+        @Override
+        public String getText() {
+          return listPredExpr.getText();
+        }
+      };
+    }
+
     // Check if the expression is a function call used as a predicate (e.g., isEmpty(x), exists(x))
     final Cypher25Parser.FunctionInvocationContext funcCtx = expressionBuilder.findFunctionInvocationRecursive(expr6);
     if (funcCtx != null) {
@@ -1228,23 +1345,35 @@ public class CypherASTBuilder extends Cypher25ParserBaseVisitor<Object> {
     // Extract path variable if present (e.g., p = (a)-[r]->(b))
 
     String pathVariable = null;
-    if (ctx.variable() != null) {
+    if (ctx.variable() != null)
       pathVariable = stripBackticks(ctx.variable().getText());
+
+    // Extract path mode (WALK, TRAIL, ACYCLIC) from pathPatternPrefix if present.
+    // The grammar has labeled alternatives (AllPath, AnyShortestPath, etc.) that each may contain pathMode().
+    // Use getRuleContext on the base class to find PathModeContext regardless of which alternative matched.
+    PathMode pathMode = null;
+    if (ctx.pathPatternPrefix() != null) {
+      final Cypher25Parser.PathModeContext pm = ctx.pathPatternPrefix().getRuleContext(
+          Cypher25Parser.PathModeContext.class, 0);
+      if (pm != null) {
+        if (pm.WALK() != null) pathMode = PathMode.WALK;
+        else if (pm.TRAIL() != null) pathMode = PathMode.TRAIL;
+        else if (pm.ACYCLIC() != null) pathMode = PathMode.ACYCLIC;
+      }
     }
 
     // Visit the anonymous pattern to get the base path
     final PathPattern basePath = visitAnonymousPattern(ctx.anonymousPattern());
 
-    // If there's a path variable, create a new PathPattern/ShortestPathPattern with it
-    // IMPORTANT: Preserve the ShortestPathPattern type if the base path is one
-    if (pathVariable != null) {
+    // If there's a path variable or path mode, create a new PathPattern with them
+    if (pathVariable != null || pathMode != null) {
       if (basePath instanceof ShortestPathPattern) {
-        // Preserve ShortestPathPattern type
         final ShortestPathPattern shortestBase = (ShortestPathPattern) basePath;
-        return new ShortestPathPattern(basePath.getNodes(), basePath.getRelationships(), pathVariable,
-            shortestBase.isAllPaths());
+        return new ShortestPathPattern(basePath.getNodes(), basePath.getRelationships(),
+            pathVariable != null ? pathVariable : basePath.getPathVariable(), shortestBase.isAllPaths());
       }
-      return new PathPattern(basePath.getNodes(), basePath.getRelationships(), pathVariable);
+      return new PathPattern(basePath.getNodes(), basePath.getRelationships(),
+          pathVariable != null ? pathVariable : basePath.getPathVariable(), pathMode);
     }
 
     return basePath;

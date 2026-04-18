@@ -22,12 +22,14 @@ import com.arcadedb.database.Database;
 import com.arcadedb.database.RID;
 import com.arcadedb.exception.TimeoutException;
 import com.arcadedb.graph.Edge;
+import com.arcadedb.graph.GAVVertex;
 import com.arcadedb.graph.GraphTraversalProvider;
 import com.arcadedb.graph.GraphTraversalProviderRegistry;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.opencypher.ast.Direction;
 import com.arcadedb.query.opencypher.ast.NodePattern;
 import com.arcadedb.query.opencypher.ast.RelationshipPattern;
+import com.arcadedb.query.opencypher.parser.CypherASTBuilder;
 import com.arcadedb.query.opencypher.traversal.TraversalPath;
 import com.arcadedb.query.sql.executor.AbstractExecutionStep;
 import com.arcadedb.query.sql.executor.CommandContext;
@@ -35,9 +37,10 @@ import com.arcadedb.query.sql.executor.Result;
 import com.arcadedb.query.sql.executor.ResultInternal;
 import com.arcadedb.query.sql.executor.ResultSet;
 
+import com.arcadedb.utility.RidHashSet;
+
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -201,11 +204,15 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
       private Result lastResult = null;
       private Iterator<Edge> currentEdges = null;
       private Iterator<Vertex> currentVertices = null;
+      // GAV reference path: iterate int[] neighbor IDs directly, zero OLTP
+      private int[] currentGavNeighborIds = null;
+      private int currentGavNeighborIdx = 0;
+      private GraphTraversalProvider currentGavProvider = null;
       // Short-circuit flag: checked lazily after first pull from predecessor
       // (predecessor might create the edge type via CREATE/FOREACH/MERGE)
       private Boolean schemaShortCircuit = null;
       private boolean useFastPath = false;
-      private Set<RID> seenEdges = null;
+      private RidHashSet seenEdges = null;
       private final List<Result> buffer = new ArrayList<>();
       private int bufferIndex = 0;
       private boolean finished = false;
@@ -238,8 +245,10 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
         bufferIndex = 0;
 
         while (buffer.size() < n) {
-          // Process using fast path (vertices directly) or standard path (edges)
-          if (useFastPath && currentVertices != null && currentVertices.hasNext()) {
+          // Process using GAV reference path, fast path, or standard path
+          if (currentGavNeighborIds != null && currentGavNeighborIdx < currentGavNeighborIds.length) {
+            processGavReferencePath(n);
+          } else if (useFastPath && currentVertices != null && currentVertices.hasNext()) {
             processFastPath(n);
           } else if (!useFastPath && currentEdges != null && currentEdges.hasNext()) {
             processStandardPath(n);
@@ -275,23 +284,58 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
               lastResult = prevResults.next();
               final Object sourceObj = lastResult.getProperty(sourceVariable);
 
-              if (sourceObj instanceof Vertex) {
-                final Vertex sourceVertex = (Vertex) sourceObj;
+              // Resolve source: accept both GAVVertex and Vertex
+              int sourceNodeId = -1;
+              Vertex sourceVertex = null;
+              if (sourceObj instanceof GAVVertex gavVertex) {
+                sourceNodeId = gavVertex.getNodeId();
+                // Don't resolve to Vertex yet — only resolve if we can't use GAV fast path
+              } else if (sourceObj instanceof Vertex)
+                sourceVertex = (Vertex) sourceObj;
+
+              if (sourceVertex != null || sourceNodeId >= 0) {
 
                 // Determine if we can use fast path for this vertex
                 useFastPath = canUseFastPath(lastResult);
 
                 if (useFastPath) {
-                  // Fast path: get vertices directly without loading edges
-                  currentVertices = getVertices(sourceVertex);
-                  currentEdges = null;
-                  seenEdges = null;
+                  // Try GAV reference path first (zero OLTP): use int nodeIds throughout
+                  final GraphTraversalProvider gavProvider = resolveGavProvider(
+                      pattern.hasTypes() ? pattern.getTypes().toArray(new String[0]) : null);
+                  if (gavProvider != null && sourceNodeId < 0 && sourceVertex != null)
+                    sourceNodeId = gavProvider.getNodeId(sourceVertex.getIdentity());
+
+                  if (gavProvider != null && sourceNodeId >= 0) {
+                    // GAV reference path: produce GAVVertex, skip all lookupByRID
+                    final Direction dir = getEffectiveDirection();
+                    final String[] types = pattern.hasTypes() ? pattern.getTypes().toArray(new String[0]) : null;
+                    int[] neighborIds = gavProvider.getNeighborIds(sourceNodeId, dir.toArcadeDirection(), types);
+                    if (dir == Direction.BOTH)
+                      neighborIds = deduplicateSelfLoops(neighborIds, sourceNodeId);
+                    currentGavNeighborIds = neighborIds;
+                    currentGavNeighborIdx = 0;
+                    currentGavProvider = gavProvider;
+                    gavUsed = true;
+                    currentVertices = null;
+                    currentEdges = null;
+                    seenEdges = null;
+                  } else {
+                    // Regular fast path: load vertices via getVertices()
+                    if (sourceVertex == null)
+                      sourceVertex = (Vertex) sourceObj;
+                    currentVertices = getVertices(sourceVertex);
+                    currentGavNeighborIds = null;
+                    currentEdges = null;
+                    seenEdges = null;
+                  }
                 } else {
-                  // Standard path: load edges
+                  // Standard path: load edges (needs full Vertex)
+                  if (sourceVertex == null)
+                    sourceVertex = (Vertex) sourceObj;
                   currentEdges = getEdges(sourceVertex);
                   currentVertices = null;
-                  // Track seen edges for BOTH direction to deduplicate self-loops
-                  seenEdges = getEffectiveDirection() == Direction.BOTH ? new HashSet<>() : null;
+                  currentGavNeighborIds = null;
+                  seenEdges = getEffectiveDirection() == Direction.BOTH ? new RidHashSet() : null;
                 }
               } else {
                 // Source is not a vertex, skip
@@ -306,6 +350,65 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
             }
           }
         }
+      }
+
+      /**
+       * GAV reference path: iterate int[] neighbor IDs, produce GAVVertex per result.
+       * Zero OLTP vertex loading — label check via bucket ID, property access via column store.
+       */
+      private void processGavReferencePath(final int n) {
+        final Database db = context.getDatabase();
+        while (currentGavNeighborIdx < currentGavNeighborIds.length && buffer.size() < n) {
+          final long begin = context.isProfiling() ? System.nanoTime() : 0;
+          try {
+            if (context.isProfiling())
+              rowCount++;
+
+            final int neighborId = currentGavNeighborIds[currentGavNeighborIdx++];
+            final RID targetRid = currentGavProvider.getRID(neighborId);
+            if (targetRid == null)
+              continue;
+
+            // Label filter via bucket ID (no vertex load)
+            if (targetNodePattern != null && targetNodePattern.hasLabels()) {
+              final String targetLabel = targetNodePattern.getLabels().get(0);
+              final String typeName = db.getSchema().getTypeByBucketId(targetRid.getBucketId()).getName();
+              if (!targetLabel.equals(typeName) && !db.getSchema().getType(typeName).instanceOf(targetLabel))
+                continue;
+            }
+
+            // Bound variable identity check (no vertex load)
+            // Compare bucket+offset only — RIDs from GAV may lack the database reference
+            if (boundVariableNames != null && boundVariableNames.contains(targetVariable)) {
+              final Object boundValue = lastResult.getProperty(targetVariable);
+              final RID boundRid;
+              if (boundValue instanceof Vertex)
+                boundRid = ((Vertex) boundValue).getIdentity();
+              else
+                boundRid = null;
+              if (boundRid != null
+                  && (boundRid.getBucketId() != targetRid.getBucketId() || boundRid.getPosition() != targetRid.getPosition()))
+                continue;
+            }
+
+            // Create result with GAVVertex (no OLTP load)
+            final ResultInternal result = new ResultInternal();
+            for (final String prop : lastResult.getPropertyNames())
+              result.setProperty(prop, lastResult.getProperty(prop));
+            result.setProperty(targetVariable,
+                new GAVVertex(targetRid, neighborId, currentGavProvider, db));
+
+            buffer.add(result);
+            if (context.isProfiling())
+              gavPathCount++;
+          } finally {
+            if (context.isProfiling())
+              cost += (System.nanoTime() - begin);
+          }
+        }
+        // Exhausted — clear state so the outer loop fetches the next source
+        if (currentGavNeighborIdx >= currentGavNeighborIds.length)
+          currentGavNeighborIds = null;
       }
 
       private void processFastPath(final int n) {
@@ -626,9 +729,10 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
           public Vertex next() {
             if (!hasNext())
               throw new NoSuchElementException();
-            final RID rid = provider.getRID(neighbors[idx++]);
+            final int neighborId = neighbors[idx++];
+            final RID rid = provider.getRID(neighborId);
             gavPathCount++;
-            return (Vertex) context.getDatabase().lookupByRID(rid, true);
+            return new GAVVertex(rid, neighborId, provider, context.getDatabase());
           }
         };
       }
@@ -763,14 +867,34 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
     for (final Map.Entry<String, Object> entry : targetNodePattern.getProperties().entrySet()) {
       final Object actual = vertex.get(entry.getKey());
       Object expected = entry.getValue();
-      // Handle string literals: remove quotes
-      if (expected instanceof String) {
+
+      // Resolve parameter references (e.g., $param -> actual value from context)
+      if (expected instanceof CypherASTBuilder.ParameterReference) {
+        final String paramName = ((CypherASTBuilder.ParameterReference) expected).getName();
+        if (context.getInputParameters() != null)
+          expected = context.getInputParameters().get(paramName);
+      } else if (expected instanceof String) {
         final String s = (String) expected;
-        if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith("\"") && s.endsWith("\"")))
+        if (s.startsWith("$")) {
+          final String paramName = s.substring(1);
+          if (context.getInputParameters() != null) {
+            final Object paramValue = context.getInputParameters().get(paramName);
+            if (paramValue != null)
+              expected = paramValue;
+          }
+        }
+        // Handle string literals: remove quotes
+        else if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith("\"") && s.endsWith("\"")))
           expected = s.substring(1, s.length() - 1);
       }
-      if (actual == null || !actual.equals(expected))
-        return false;
+
+      if (actual == null || !actual.equals(expected)) {
+        if (actual instanceof Number && expected instanceof Number) {
+          if (((Number) actual).longValue() != ((Number) expected).longValue())
+            return false;
+        } else
+          return false;
+      }
     }
     return true;
   }
@@ -833,9 +957,35 @@ public class MatchRelationshipStep extends AbstractExecutionStep {
 
     for (final Map.Entry<String, Object> entry : pattern.getProperties().entrySet()) {
       final Object actual = edge.get(entry.getKey());
-      final Object expected = entry.getValue();
-      if (actual == null || !actual.equals(expected))
-        return false;
+      Object expected = entry.getValue();
+
+      // Resolve parameter references (e.g., $param -> actual value from context)
+      if (expected instanceof CypherASTBuilder.ParameterReference) {
+        final String paramName = ((CypherASTBuilder.ParameterReference) expected).getName();
+        if (context.getInputParameters() != null)
+          expected = context.getInputParameters().get(paramName);
+      } else if (expected instanceof String) {
+        final String s = (String) expected;
+        if (s.startsWith("$")) {
+          final String paramName = s.substring(1);
+          if (context.getInputParameters() != null) {
+            final Object paramValue = context.getInputParameters().get(paramName);
+            if (paramValue != null)
+              expected = paramValue;
+          }
+        }
+        // Handle string literals: remove quotes
+        else if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith("\"") && s.endsWith("\"")))
+          expected = s.substring(1, s.length() - 1);
+      }
+
+      if (actual == null || !actual.equals(expected)) {
+        if (actual instanceof Number && expected instanceof Number) {
+          if (((Number) actual).longValue() != ((Number) expected).longValue())
+            return false;
+        } else
+          return false;
+      }
     }
     return true;
   }

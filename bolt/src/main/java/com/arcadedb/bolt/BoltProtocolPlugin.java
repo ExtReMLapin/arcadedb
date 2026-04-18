@@ -35,6 +35,11 @@ public class BoltProtocolPlugin implements ServerPlugin {
   private int                 port;
 
   @Override
+  public String getName() {
+    return "Neo4j-Bolt";
+  }
+
+  @Override
   public void configure(final ArcadeDBServer arcadeDBServer, final ContextConfiguration configuration) {
     this.server = arcadeDBServer;
     this.host = configuration.getValueAsString(GlobalConfiguration.BOLT_HOST);
@@ -43,7 +48,8 @@ public class BoltProtocolPlugin implements ServerPlugin {
 
   @Override
   public void startService() {
-    listener = new BoltNetworkListener(server, new DefaultServerSocketFactory(), host, String.valueOf(port));
+    final BoltSslHelper sslHelper = new BoltSslHelper(server.getConfiguration());
+    listener = new BoltNetworkListener(server, new DefaultServerSocketFactory(), sslHelper, host, String.valueOf(port));
   }
 
   @Override

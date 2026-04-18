@@ -22,10 +22,10 @@
   "dependencies": {
     "@fortawesome/fontawesome-free": "^7.2.0",
     "@popperjs/core": "^2.11.8",
-    "apexcharts": "^5.10.4",
+    "apexcharts": "^5.10.6",
     "bootstrap": "^5.3.8",
     "codemirror": "^5.65.21",
-    "cytoscape": "^3.33.1",
+    "cytoscape": "^3.33.2",
     "cytoscape-cxtmenu": "^3.5.0",
     "cytoscape-fcose": "^2.2.0",
     "cytoscape-graphml": "^1.0.6",
@@ -39,11 +39,11 @@
     "datatables.net-select": "^3.1.3",
     "datatables.net-select-bs5": "^3.1.3",
     "jquery": "^4.0.0",
-    "marked": "^17.0.4",
+    "marked": "^18.0.0",
     "jszip": "^3.10.1",
-    "pdfmake": "^0.3.6",
-    "swagger-ui-dist": "^5.32.0",
-    "sweetalert2": "^11.26.22"
+    "pdfmake": "^0.3.7",
+    "swagger-ui-dist": "^5.32.2",
+    "sweetalert2": "^11.26.24"
   },
   "devDependencies": {
     "copy-webpack-plugin": "^14.0.0",
@@ -52,8 +52,8 @@
     "html-webpack-plugin": "^5.6.6",
     "style-loader": "^4.0.0",
     "url-loader": "^4.1.1",
-    "webpack": "^5.105.4",
-    "webpack-cli": "^7.0.0"
+    "webpack": "^5.106.1",
+    "webpack-cli": "^7.0.2"
   },
   "overrides": {
     "ajv": "^8.18.0"

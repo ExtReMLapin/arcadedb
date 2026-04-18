@@ -110,6 +110,7 @@ statement
 
     // DDL Statements - DROP variants
     | DROP TYPE dropTypeBody                         # dropTypeStmt
+    | DROP TIMESERIES TYPE dropTypeBody              # dropTimeSeriesTypeStmt
     | DROP PROPERTY dropPropertyBody                 # dropPropertyStmt
     | DROP INDEX dropIndexBody                       # dropIndexStmt
     | DROP BUCKET dropBucketBody                     # dropBucketStmt
@@ -199,6 +200,7 @@ selectStatement
         | limit skip?
       )?
       timeout?
+      PARALLEL?
     ;
 
 /**
@@ -247,8 +249,8 @@ matchMethod
     : DOT matchMethodCall matchProperties?                                     // .out('Friend'){as:x}
     | DOT LPAREN nestedMatchPath RPAREN matchProperties?                       // .(out().in(){...}){as:x}
     | (MINUS | ARROW_LEFT) identifier (MINUS | ARROW_RIGHT) matchProperties?  // -Friend->{as:x}
-    | DECR GT matchProperties?                                                 // -->{as:x} anonymous outgoing
-    | ARROW_LEFT MINUS matchProperties?                                        // <--{as:x} anonymous incoming
+    | DECR GT matchProperties                                                  // -->{as:x} anonymous outgoing (properties required)
+    | ARROW_LEFT MINUS matchProperties                                         // <--{as:x} anonymous incoming (properties required)
     | DECR matchProperties?                                                    // --{as:x} anonymous bidirectional
     ;
 
@@ -261,8 +263,8 @@ nestedMatchMethod
     | DOT identifier LPAREN (STAR | expression (COMMA expression)*)? RPAREN matchProperties?  // .out('X'){...}
     | identifier matchProperties?                                              // methodName{...}
     | (MINUS | ARROW_LEFT) identifier (MINUS | ARROW_RIGHT) matchProperties?  // -Friend->{as:x}
-    | DECR GT matchProperties?                                                 // -->{as:x}
-    | ARROW_LEFT MINUS matchProperties?                                        // <--{as:x}
+    | DECR GT matchProperties                                                  // -->{as:x} (properties required)
+    | ARROW_LEFT MINUS matchProperties                                         // <--{as:x} (properties required)
     | DECR matchProperties?                                                    // --{as:x}
     ;
 
@@ -288,8 +290,7 @@ matchFilterItem
     ;
 
 matchFilterItemKey
-    : identifier
-    | TYPE        // type: Person
+    : TYPE        // type: Person
     | TYPES       // types: [Person, Company]
     | BUCKET      // bucket: bucketName
     | AS          // as: alias
@@ -360,6 +361,7 @@ updateStatement
       (RETURN (BEFORE | AFTER | COUNT) projection?)?
       (WHERE whereClause)?
       limit?
+      (BATCH expression)?
       timeout?
     ;
 
@@ -399,6 +401,7 @@ deleteStatement
       (RETURN BEFORE)?
       (WHERE whereClause)?
       limit?
+      (BATCH expression)?
       UNSAFE?
     ;
 
@@ -440,17 +443,31 @@ createTypeBody
 
 /**
  * CREATE TIMESERIES TYPE body
- * Example: CREATE TIMESERIES TYPE SensorData TIMESTAMP ts TAGS (sensor_id STRING) FIELDS (temperature DOUBLE, humidity DOUBLE) SHARDS 4 RETENTION 90 DAYS COMPACTION_INTERVAL 1 HOURS
+ * Example: CREATE TIMESERIES TYPE SensorData TIMESTAMP ts PRECISION NANOSECOND TAGS (sensor_id STRING) FIELDS (temperature DOUBLE, humidity DOUBLE) SHARDS 4 RETENTION 90 DAYS COMPACTION_INTERVAL 1 HOURS
  */
 createTimeSeriesTypeBody
     : identifier
       (IF NOT EXISTS)?
-      (TIMESTAMP identifier)?
+      (TIMESTAMP identifier (PRECISION tsPrecision)?)?
       (TAGS LPAREN tsTagColumnDef (COMMA tsTagColumnDef)* RPAREN)?
       (FIELDS LPAREN tsFieldColumnDef (COMMA tsFieldColumnDef)* RPAREN)?
       (SHARDS INTEGER_LITERAL)?
-      (RETENTION INTEGER_LITERAL (DAYS | HOURS | MINUTES)?)?
-      (COMPACTION_INTERVAL INTEGER_LITERAL (DAYS | HOURS | MINUTES)?)?
+      (RETENTION INTEGER_LITERAL tsRetentionUnit?)?
+      ((COMPACTION_INTERVAL | COMPACTION INTERVAL) INTEGER_LITERAL tsRetentionUnit?)?
+    ;
+
+tsPrecision
+    : NANOSECOND
+    | MICROSECOND
+    | MILLISECOND
+    | SECOND
+    ;
+
+tsRetentionUnit
+    : DAYS
+    | HOURS
+    | MINUTES
+    | SECONDS
     ;
 
 tsTagColumnDef
@@ -479,8 +496,10 @@ tsTimeUnit
     : DAYS
     | HOURS
     | MINUTES
+    | SECONDS
     | HOUR
     | MINUTE
+    | SECOND
     ;
 
 /**
@@ -543,10 +562,11 @@ createIndexBody
       (NULL_STRATEGY identifier)?
       (METADATA json)?
       (ENGINE identifier)?
+    | QUOTED_IDENTIFIER (IF NOT EXISTS)? indexType (ENGINE identifier | METADATA json | NULL_STRATEGY identifier)*
     ;
 
 indexProperty
-    : identifier (BY (KEY | VALUE | ITEM))?
+    : identifier (BY (KEY | VALUE | ITEM))? (COLLATE identifier)?
     ;
 
 indexType
@@ -566,7 +586,7 @@ createBucketBody
  * Supports VALUES, SET, and CONTENT clauses similar to INSERT
  */
 createVertexBody
-    : identifier?
+    : (identifier (BUCKET identifier)? | BUCKET_IDENTIFIER | BUCKET_NUMBER_IDENTIFIER)?
       ( LPAREN identifier (COMMA identifier)* RPAREN
         VALUES LPAREN expression (COMMA expression)* RPAREN
         (COMMA LPAREN expression (COMMA expression)* RPAREN)*
@@ -618,7 +638,7 @@ alterPropertyItem
     ;
 
 alterBucketBody
-    : identifier alterBucketItem (COMMA alterBucketItem)*
+    : identifier STAR? alterBucketItem (COMMA alterBucketItem)*
     ;
 
 alterBucketItem
@@ -643,7 +663,7 @@ dropTypeBody
     ;
 
 dropPropertyBody
-    : identifier DOT identifier (IF EXISTS)?
+    : identifier DOT identifier (IF EXISTS)? FORCE?
     ;
 
 dropIndexBody
@@ -651,7 +671,7 @@ dropIndexBody
     ;
 
 dropBucketBody
-    : identifier (IF EXISTS)?
+    : (identifier | INTEGER_LITERAL) (IF EXISTS)?
     ;
 
 // ============================================================================
@@ -832,11 +852,12 @@ truncateTypeBody
     ;
 
 truncateBucketBody
-    : identifier UNSAFE?
+    : (identifier | INTEGER_LITERAL) UNSAFE?
     ;
 
 truncateRecordBody
-    : rid (COMMA rid)*
+    : rid
+    | LBRACKET rid (COMMA rid)* RBRACKET
     ;
 
 // ============================================================================
@@ -928,7 +949,7 @@ beginStatement
  * COMMIT [RETRY n [ELSE {statements} [AND] (FAIL|CONTINUE)]]
  */
 commitStatement
-    : COMMIT (RETRY INTEGER_LITERAL (ELSE (LBRACE (scriptStatement SEMICOLON?)* RBRACE)? (AND? (FAIL | CONTINUE))?)?)?
+    : COMMIT (RETRY INTEGER_LITERAL (ELSE (LBRACE (scriptStatement SEMICOLON?)+ RBRACE (AND (FAIL | CONTINUE))? | (FAIL | CONTINUE)))?)?
     ;
 
 /**
@@ -976,7 +997,7 @@ importDatabaseStatement
     ;
 
 exportDatabaseStatement
-    : EXPORT DATABASE url (WITH settingList)?
+    : EXPORT DATABASE (url)? (WITH settingList)?
     ;
 
 backupDatabaseStatement
@@ -1138,7 +1159,7 @@ orderDirection
  * UNWIND clause
  */
 unwind
-    : UNWIND expression (AS? identifier)?
+    : UNWIND expression (AS? identifier)? (COMMA expression (AS? identifier)?)*
     ;
 
 /**
@@ -1159,7 +1180,7 @@ limit
  * TIMEOUT clause
  */
 timeout
-    : TIMEOUT expression
+    : TIMEOUT expression (EXCEPTION | RETURN)?
     ;
 
 /**
@@ -1223,7 +1244,7 @@ mathExpression
 baseExpression
     : INTEGER_LITERAL                                                   # integerLiteral
     | FLOATING_POINT_LITERAL                                            # floatLiteral
-    | STRING_LITERAL modifier*                                          # stringLiteral
+    | (STRING_LITERAL | RID_STRING) modifier*                          # stringLiteral
     | CHARACTER_LITERAL modifier*                                       # charLiteral
     | INTEGER_RANGE                                                     # integerRange
     | ELLIPSIS_INTEGER_RANGE                                            # ellipsisIntegerRange
@@ -1301,6 +1322,7 @@ arraySelector
     | LBRACKET LIKE expression RBRACKET                                       # arrayLikeSelector
     | LBRACKET ILIKE expression RBRACKET                                      # arrayIlikeSelector
     | LBRACKET IN expression RBRACKET                                         # arrayInSelector
+    | LBRACKET NOT IN expression RBRACKET                                     # arrayNotInSelector
     | LBRACKET expression comparisonOperator expression RBRACKET              # arrayBinaryCondSelector
     | LBRACKET (expression | rid | inputParameter) RBRACKET                  # arraySingleSelector
     ;
@@ -1310,7 +1332,8 @@ arraySelector
  * Supports both property access (.identifier) and method calls (.identifier(args))
  */
 modifier
-    : DOT identifier (LPAREN (expression (COMMA expression)*)? RPAREN)?
+    : DOT STAR
+    | DOT identifier (LPAREN (expression (COMMA expression)*)? RPAREN)?
     | arraySelector
     ;
 
@@ -1319,7 +1342,7 @@ modifier
  */
 inputParameter
     : HOOK
-    | COLON identifier
+    | COLON (identifier | FROM)
     | DOLLAR INTEGER_LITERAL
     ;
 
@@ -1406,6 +1429,9 @@ identifier
     | QUOTED_IDENTIFIER
     | THIS
     | RID_ATTR
+    | RID_ID_ATTR
+    | RID_POS_ATTR
+    | PROPS_ATTR
     | OUT_ATTR
     | IN_ATTR
     | TYPE_ATTR
@@ -1466,6 +1492,12 @@ identifier
     | DAYS
     | HOURS
     | MINUTES
+    | SECONDS
+    | PRECISION
+    | NANOSECOND
+    | MICROSECOND
+    | MILLISECOND
+    | INTERVAL
     | DOWNSAMPLING
     | POLICY
     | GRANULARITY
@@ -1547,4 +1579,5 @@ identifier
     | PROPERTIES
     | COMPACTION
     | THRESHOLD
+    | OVERWRITE
     ;

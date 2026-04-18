@@ -401,6 +401,11 @@ function updateDatabases(callback, preferSelected) {
       $("#studioPanel").show();
       console.log("UI updated - login page hidden, studio panel shown");
 
+      if (databases.length === 0)
+        showQuickStart();
+      else
+        hideQuickStart();
+
       // These operations should not block login completion
       try {
         displaySchema();
@@ -502,6 +507,197 @@ function createDatabase() {
         globalNotifyError(jqXHR.responseText);
       });
   });
+}
+
+// ===== Quick Start Panel (shown when no databases exist) =====
+
+var sampleDatasets = null;
+var datasetsBaseUrl = "https://github.com/ArcadeData/arcadedb-datasets/raw/main/";
+var datasetsJsonUrl = "https://raw.githubusercontent.com/ArcadeData/arcadedb-datasets/main/datasets.json";
+
+function formatNumber(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "K";
+  return "" + n;
+}
+
+function showQuickStart() {
+  if (sampleDatasets != null) {
+    renderQuickStartCards();
+    return;
+  }
+
+  $("#quickStartDatasets").html(
+    '<div class="col-12 text-center text-muted" style="padding: 40px;"><i class="fa fa-spinner fa-spin"></i> Loading datasets...</div>'
+  );
+  $("#quickStartOverlay").hide();
+  $("#quickStartPanel").show();
+  $("#mainTabContent").hide();
+
+  jQuery.ajax({
+    type: "GET",
+    url: datasetsJsonUrl,
+    dataType: "json",
+    timeout: 10000
+  }).done(function(data) {
+    sampleDatasets = data.datasets || [];
+    renderQuickStartCards();
+  }).fail(function() {
+    $("#quickStartDatasets").html(
+      '<div class="col-12 text-center text-muted" style="padding: 40px;">Unable to load sample datasets. Create a database manually using the button above.</div>'
+    );
+  });
+}
+
+function buildDatasetCardHtml(ds, fromModal) {
+  var parts = [];
+  if (ds.vertices != null) parts.push(formatNumber(ds.vertices) + " vertices");
+  if (ds.edges != null) parts.push(formatNumber(ds.edges) + " edges");
+  if (ds.fileSizeMB != null) parts.push(ds.fileSizeMB < 1 ? (ds.fileSizeMB * 1000).toFixed(0) + " KB" : ds.fileSizeMB.toFixed(1) + " MB");
+  var stats = parts.length > 0 ? '<div class="text-muted" style="font-size: 0.75rem; margin-top: 4px;">' + parts.join(" &middot; ") + '</div>' : "";
+  var infoLink = ds.url ? ' <a href="' + escapeHtml(ds.url) + '" target="_blank" onclick="event.stopPropagation();" title="More info" style="color: #aaa; font-size: 0.8rem;"><i class="fa fa-circle-info"></i></a>' : "";
+  var onclick = "importSampleDatabase('" + escapeHtml(ds.name) + "', '" + escapeHtml(ds.path) + "', '" + escapeHtml(ds.format) + "'" + (fromModal ? ", true" : "") + ")";
+  return '<div class="col-md-4">' +
+    '<div class="card quick-start-card" onclick="' + onclick + '">' +
+      '<div class="card-body text-center" style="padding: 20px 16px;">' +
+        '<i class="fa ' + escapeHtml(ds.icon) + '" style="font-size: 2rem; color: #00aeee; margin-bottom: 10px; display: block;"></i>' +
+        '<div style="font-weight: 600; font-size: 0.95rem; margin-bottom: 4px;">' + escapeHtml(ds.name) + infoLink + '</div>' +
+        '<div class="text-muted" style="font-size: 0.8rem;">' + escapeHtml(ds.description) + '</div>' +
+        stats +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function renderQuickStartCards() {
+  var html = "";
+  for (var i = 0; i < sampleDatasets.length; i++)
+    html += buildDatasetCardHtml(sampleDatasets[i], false);
+  $("#quickStartDatasets").html(html);
+  $("#quickStartOverlay").hide();
+  $("#quickStartPanel").show();
+  $("#mainTabContent").hide();
+}
+
+function hideQuickStart() {
+  $("#quickStartOverlay").hide();
+  $("#quickStartPanel").hide();
+  $("#mainTabContent").show();
+}
+
+function importSampleDatabase(name, path, format, fromModal) {
+  var url = datasetsBaseUrl + path;
+  var overlay = fromModal ? "#importDatasetOverlay" : "#quickStartOverlay";
+  var isRestore = (format === "arcadedb");
+
+  $(overlay).html(
+    '<div class="spinner-border text-primary" style="width: 3rem; height: 3rem;"></div>' +
+    '<h5 id="importProgressTitle" style="margin-top: 16px; font-weight: 600;">Importing ' + escapeHtml(name) + '...</h5>' +
+    '<p id="importProgressMsg" style="color: var(--text-secondary, #888);">Connecting to server...</p>'
+  ).css("display", "flex");
+
+  var onComplete = function() {
+    globalNotify("Success", name + " imported successfully!", "success");
+    if (fromModal)
+      bootstrap.Modal.getInstance(document.getElementById("importDatasetModal")).hide();
+    updateDatabases(null, name);
+  };
+  var onError = function(msg) {
+    globalNotifyError(msg || "Import failed");
+    $(overlay).hide();
+  };
+
+  // Use SSE streaming for real-time progress
+  var command = isRestore ? "restore database " + name + " " + url : "import database " + name + " " + url;
+  importWithSSE(command, onComplete, onError);
+}
+
+function importWithSSE(command, onComplete, onError) {
+  fetch("api/v1/server", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": globalCredentials,
+      "Accept": "text/event-stream"
+    },
+    body: JSON.stringify({ command: command })
+  }).then(function(response) {
+    if (!response.ok) {
+      response.text().then(function(t) { onError(t); });
+      return;
+    }
+    var reader = response.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+
+    function processChunk(result) {
+      if (result.done) return;
+      buffer += decoder.decode(result.value, { stream: true });
+      var lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete line in buffer
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line.startsWith("data: ")) continue;
+        try {
+          var event = JSON.parse(line.substring(6));
+          if (event.status === "completed") {
+            onComplete();
+            return;
+          } else if (event.status === "error") {
+            onError(event.message);
+            return;
+          } else if (event.status === "progress") {
+            var msg = event.message || "";
+            if (event.vertices != null || event.edges != null) {
+              var parts = [];
+              if (event.vertices) parts.push(formatNumber(event.vertices) + " vertices");
+              if (event.edges) parts.push(formatNumber(event.edges) + " edges");
+              if (event.parsed) parts.push(formatNumber(event.parsed) + " parsed");
+              msg = parts.join(" &middot; ");
+            }
+            if (msg) $("#importProgressMsg").html(msg);
+          }
+        } catch (e) { /* ignore malformed events */ }
+      }
+      reader.read().then(processChunk);
+    }
+    reader.read().then(processChunk);
+  }).catch(function(err) {
+    onError(err.message || "Connection failed");
+  });
+}
+
+function showImportDatasetModal() {
+  var renderCards = function() {
+    var html = "";
+    for (var i = 0; i < sampleDatasets.length; i++)
+      html += buildDatasetCardHtml(sampleDatasets[i], true);
+    $("#importDatasetCards").html(html);
+    $("#importDatasetOverlay").hide();
+  };
+
+  if (sampleDatasets != null) {
+    renderCards();
+  } else {
+    $("#importDatasetCards").html(
+      '<div class="col-12 text-center text-muted" style="padding: 40px;"><i class="fa fa-spinner fa-spin"></i> Loading datasets...</div>'
+    );
+    jQuery.ajax({
+      type: "GET",
+      url: datasetsJsonUrl,
+      dataType: "json",
+      timeout: 10000
+    }).done(function(data) {
+      sampleDatasets = data.datasets || [];
+      renderCards();
+    }).fail(function() {
+      $("#importDatasetCards").html(
+        '<div class="col-12 text-center text-muted" style="padding: 40px;">Unable to load sample datasets.</div>'
+      );
+    });
+  }
+
+  new bootstrap.Modal(document.getElementById("importDatasetModal")).show();
 }
 
 function dropDatabase() {
@@ -2352,7 +2548,7 @@ function populateSettingsPanel() {
   let truncateChecked = (truncateSaved == null || truncateSaved == "true") ? "checked" : "";
 
   let fitSaved = globalStorageLoad("table.fitInPage");
-  let fitChecked = (fitSaved == null || fitSaved == "true") ? "checked" : "";
+  let fitChecked = (fitSaved == "true") ? "checked" : "";
 
   let currentLimit = $("#inputLimit").val() || "20";
 
@@ -2380,6 +2576,7 @@ function populateSettingsPanel() {
   let cumulativeChecked = (globalGraphSettings && globalGraphSettings.cumulativeSelection) ? "checked" : "";
   let nodeSizeVal = globalGraphSettings ? (globalGraphSettings.nodeSize || 25) : 25;
   let defaultLabelVal = globalGraphSettings ? (globalGraphSettings.defaultLabel != null ? globalGraphSettings.defaultLabel : "") : "";
+  let maxLabelVal = globalGraphSettings ? (globalGraphSettings.maxLabelLength || 45) : 45;
 
   html += "<div class='settings-section'>";
   html += "<div class='settings-section-header'>Graph Settings</div>";
@@ -2391,6 +2588,8 @@ function populateSettingsPanel() {
   html += "<option value='name'" + (defaultLabelVal == "name" ? " selected" : "") + ">name</option>";
   html += "<option value='@type'" + (defaultLabelVal == "@type" ? " selected" : "") + ">@type</option>";
   html += "</select></div>";
+  html += "<div class='settings-row'><label>Max Label Length: <span id='settingMaxLabelVal'>" + (maxLabelVal == 0 ? "off" : maxLabelVal) + "</span></label>";
+  html += "<input type='range' class='form-range' id='settingMaxLabel' min='0' max='100' step='5' value='" + maxLabelVal + "' onchange='applyMaxLabelLength(this.value)'></div>";
   html += "<div class='settings-row'><label>Graph Spacing: <span id='settingGraphSpacingVal'>" + spacingVal + "</span></label>";
   html += "<input type='range' class='form-range' id='settingGraphSpacing' min='10' max='150' step='10' value='" + spacingVal + "' onchange='applyGraphSpacing(this.value)'></div>";
   html += "<div class='settings-row'><label>Cumulative Selection</label>";
@@ -2442,10 +2641,96 @@ function applyNodeSize(value) {
   if (globalCy != null) renderGraph();
 }
 
+function applyMaxLabelLength(value) {
+  globalGraphSettings.maxLabelLength = parseInt(value);
+  $("#settingMaxLabelVal").text(value == 0 ? "off" : value);
+  saveGraphGlobalSettings();
+  if (globalCy != null) renderGraph();
+}
+
 function applyDefaultLabel(value) {
   globalGraphSettings.defaultLabel = value;
   saveGraphGlobalSettings();
   if (globalCy != null) renderGraph();
+}
+
+function browseType(typeName) {
+  let database = getCurrentDatabase();
+  if (!database) return;
+
+  let limit = parseInt($("#inputLimit").val()) || 100;
+  let query = "select from `" + typeName + "` limit " + limit;
+
+  // If a graph already exists, append results to it
+  if (globalCy != null && globalResultset != null) {
+    $("#inputLanguage").val("sql");
+    editor.setValue(query);
+    globalActivateTab("tab-query");
+    globalActivateTab("tab-graph");
+
+    $("#executeSpinner").show();
+
+    jQuery.ajax({
+      type: "POST",
+      url: "api/v1/command/" + database,
+      data: JSON.stringify({ language: "sql", command: escapeHtml(query), limit: limit, serializer: "studio" }),
+      beforeSend: function(xhr) { xhr.setRequestHeader("Authorization", globalCredentials); }
+    }).done(function(data) {
+      $("#executeSpinner").hide();
+      appendToGraph(data.result);
+      $("#result-num").html(globalResultset.vertices.length + " vertices, " + globalTotalEdges + " edges");
+      $("#resultJson").val(JSON.stringify({ result: globalResultset }, null, 2));
+    }).fail(function(jqXHR) {
+      $("#executeSpinner").hide();
+      globalNotifyError(jqXHR.responseText);
+    });
+    return;
+  }
+
+  // No existing graph - use normal executeCommand flow
+  executeCommand("sql", query);
+}
+
+function browseType(typeName) {
+  let database = getCurrentDatabase();
+  if (!database) return;
+
+  let limit = parseInt($("#inputLimit").val()) || 100;
+  let query = "select from `" + typeName + "` limit " + limit;
+
+  $("#inputLanguage").val("sql");
+  editor.setValue(query);
+  globalActivateTab("tab-query");
+  globalActivateTab("tab-graph");
+
+  $("#executeSpinner").show();
+
+  jQuery.ajax({
+    type: "POST",
+    url: "api/v1/command/" + database,
+    data: JSON.stringify({ language: "sql", command: escapeHtml(query), limit: limit, serializer: "studio" }),
+    beforeSend: function(xhr) { xhr.setRequestHeader("Authorization", globalCredentials); }
+  }).done(function(data) {
+    $("#executeSpinner").hide();
+    $("#resultJson").val(JSON.stringify(data, null, 2));
+
+    if (globalCy != null && globalResultset != null && data.result.vertices.length > 0) {
+      // Append to existing graph
+      appendToGraph(data.result);
+      $("#result-num").html(globalResultset.vertices.length + " vertices, " + globalTotalEdges + " edges");
+    } else {
+      // First click or no vertices - create fresh graph
+      globalResultset = data.result;
+      globalCy = null;
+      $("#result-num").html(data.result.records.length);
+      renderGraph();
+    }
+
+    $("#inputGraphSearch").val("");
+  }).fail(function(jqXHR) {
+    $("#executeSpinner").hide();
+    globalNotifyError(jqXHR.responseText);
+  });
 }
 
 function executeCommand(language, query) {
@@ -2531,7 +2816,7 @@ function executeCommandTable() {
       $("#resultExplain").val(data.explain != null ? data.explain : "No profiler data found");
 
       globalExplainPlan = data.explainPlan || null;
-      renderFlameGraph(globalExplainPlan);
+      renderFlameGraph(globalExplainPlan, data.profile || null);
 
       globalResultset = data.result;
       globalCy = null;
@@ -2585,7 +2870,7 @@ function executeCommandGraph() {
       $("#resultExplain").val(data.explain != null ? data.explain : "No profiler data found");
 
       globalExplainPlan = data.explainPlan || null;
-      renderFlameGraph(globalExplainPlan);
+      renderFlameGraph(globalExplainPlan, data.profile || null);
 
       globalResultset = data.result;
       globalCy = null;
@@ -2981,7 +3266,7 @@ function populateQuerySidebar() {
       let name = escapeHtml(row.name);
       let records = (row.records || 0).toLocaleString();
       html += "<a class='sidebar-badge' href='#' style='background-color: " + color + "' ";
-      html += "onclick='executeCommand(\"sql\", \"select from \\`" + row.name + "\\`\"); return false;' ";
+      html += "onclick='browseType(\"" + row.name + "\"); return false;' ";
       html += "title='" + name + " (" + records + " records)'>";
       html += "<span class='sidebar-badge-name'>" + name + "</span>";
       html += "<span class='sidebar-badge-count'>" + records + "</span>";
@@ -3664,11 +3949,13 @@ function createGraphAnalyticalView() {
   let edgeTypes = [];
   let typeCounts = {}; // name -> count
   let typeProperties = {}; // name -> number of properties
+  let typePropertyNames = {}; // name -> array of property names
   if (window._schemaTypes) {
     for (let i in window._schemaTypes) {
       let t = window._schemaTypes[i];
       typeCounts[t.name] = t.records || 0;
       typeProperties[t.name] = (t.properties && t.properties.length) || 0;
+      typePropertyNames[t.name] = t.properties ? t.properties.map(function (p) { return p.name; }) : [];
       if (t.type === "vertex")
         vertexTypes.push(t.name);
       else if (t.type === "edge")
@@ -3681,6 +3968,7 @@ function createGraphAnalyticalView() {
   // Store for RAM estimation
   window._gavCreateTypeCounts = typeCounts;
   window._gavCreateTypeProperties = typeProperties;
+  window._gavCreateTypePropertyNames = typePropertyNames;
   window._gavCreateVertexTypes = vertexTypes;
   window._gavCreateEdgeTypes = edgeTypes;
 
@@ -3700,8 +3988,9 @@ function createGraphAnalyticalView() {
   html += "<div id='gavNameFeedback' style='font-size:0.78rem;min-height:20px;margin-bottom:8px;'></div>";
 
   // -- Vertex types multi-select --
-  html += "<label>Vertex Types <small class='text-muted'>(optional, leave empty for all)</small></label>";
+  html += "<label>Vertex Types</label>";
   html += "<select class='form-select mt-1 mb-2' id='inputGavVertexTypes' multiple style='height:auto;min-height:38px;max-height:120px;'>";
+  html += "<option value='__ALL__' selected style='font-style:italic;'>All types</option>";
   for (let i = 0; i < vertexTypes.length; i++) {
     let cnt = typeCounts[vertexTypes[i]] || 0;
     html += "<option value='" + escapeHtml(vertexTypes[i]) + "'>" + escapeHtml(vertexTypes[i]) + " (" + cnt.toLocaleString() + ")</option>";
@@ -3711,8 +4000,9 @@ function createGraphAnalyticalView() {
     html += "<small class='text-muted' style='display:block;margin-top:-4px;margin-bottom:10px;'>No vertex types defined yet.</small>";
 
   // -- Edge types multi-select --
-  html += "<label>Edge Types <small class='text-muted'>(optional, leave empty for all)</small></label>";
+  html += "<label>Edge Types</label>";
   html += "<select class='form-select mt-1 mb-2' id='inputGavEdgeTypes' multiple style='height:auto;min-height:38px;max-height:120px;'>";
+  html += "<option value='__ALL__' selected style='font-style:italic;'>All types</option>";
   for (let i = 0; i < edgeTypes.length; i++) {
     let cnt = typeCounts[edgeTypes[i]] || 0;
     html += "<option value='" + escapeHtml(edgeTypes[i]) + "'>" + escapeHtml(edgeTypes[i]) + " (" + cnt.toLocaleString() + ")</option>";
@@ -3723,8 +4013,8 @@ function createGraphAnalyticalView() {
 
   // -- Vertex Properties filter --
   html += "<label for='inputGavProperties'>Vertex Properties <small class='text-muted'>(optional, comma-separated)</small></label>";
-  html += "<input class='form-control mt-1 mb-1' id='inputGavProperties' placeholder='e.g. name, age, score'>";
-  html += "<small class='text-muted' style='display:block;margin-bottom:10px;'>Materialized in columnar storage for fast analytical scans. Leave empty for all.</small>";
+  html += "<input class='form-control mt-1 mb-1' id='inputGavProperties' placeholder='e.g. name, age, score  or  !Body, !Text'>";
+  html += "<small class='text-muted' style='display:block;margin-bottom:10px;'>Materialized in columnar storage. Leave empty for all. Prefix with <code>!</code> to exclude (e.g. <code>!Body, !Text</code> = all except Body and Text).</small>";
 
   // -- Edge Properties (new) --
   html += "<div class='gav-section-header'><label for='inputGavEdgeProperties'>Edge Properties</label>";
@@ -3777,10 +4067,15 @@ function createGraphAnalyticalView() {
     command += " `" + name + "`";
 
     let vt = $("#inputGavVertexTypes").val();
+    // Filter out the "All types" sentinel — no VERTEX TYPES clause means all
+    if (vt)
+      vt = vt.filter(function (v) { return v !== "__ALL__"; });
     if (vt && vt.length > 0)
       command += " VERTEX TYPES (" + vt.map(function (v) { return "`" + v + "`"; }).join(", ") + ")";
 
     let et = $("#inputGavEdgeTypes").val();
+    if (et)
+      et = et.filter(function (e) { return e !== "__ALL__"; });
     if (et && et.length > 0)
       command += " EDGE TYPES (" + et.map(function (e) { return "`" + e + "`"; }).join(", ") + ")";
 
@@ -3878,6 +4173,25 @@ function createGraphAnalyticalView() {
       icon.toggleClass("fa-chevron-right fa-chevron-down");
     });
 
+    // "All types" mutual exclusion: selecting specific types deselects "All types" and vice versa
+    $("#inputGavVertexTypes, #inputGavEdgeTypes").on("change", function () {
+      let sel = $(this);
+      let vals = sel.val() || [];
+      if (vals.includes("__ALL__") && vals.length > 1) {
+        // User clicked "All types" while specific types were selected -> select only "All types"
+        // OR user clicked a specific type while "All types" was selected -> deselect "All types"
+        let allWasSelected = sel.data("prevHadAll");
+        if (allWasSelected)
+          sel.val(vals.filter(function (v) { return v !== "__ALL__"; }));
+        else
+          sel.val(["__ALL__"]);
+      }
+      sel.data("prevHadAll", (sel.val() || []).includes("__ALL__"));
+    });
+    // Initialize prevHadAll
+    $("#inputGavVertexTypes").data("prevHadAll", true);
+    $("#inputGavEdgeTypes").data("prevHadAll", true);
+
     // Live RAM estimation on any input change
     $("#inputGavVertexTypes, #inputGavEdgeTypes").on("change", gavUpdateRamEstimate);
     $("#inputGavProperties, #inputGavEdgeProperties").on("input", gavUpdateRamEstimate);
@@ -3901,14 +4215,15 @@ function createGraphAnalyticalView() {
 function gavUpdateRamEstimate() {
   let typeCounts = window._gavCreateTypeCounts || {};
   let typeProperties = window._gavCreateTypeProperties || {};
+  let typePropertyNames = window._gavCreateTypePropertyNames || {};
   let allVertexTypes = window._gavCreateVertexTypes || [];
   let allEdgeTypes = window._gavCreateEdgeTypes || [];
 
-  // Selected types (empty = all)
-  let selectedVT = $("#inputGavVertexTypes").val();
-  let selectedET = $("#inputGavEdgeTypes").val();
-  let vtList = (selectedVT && selectedVT.length > 0) ? selectedVT : allVertexTypes;
-  let etList = (selectedET && selectedET.length > 0) ? selectedET : allEdgeTypes;
+  // Selected types (empty or "All types" = all)
+  let selectedVT = ($("#inputGavVertexTypes").val() || []).filter(function (v) { return v !== "__ALL__"; });
+  let selectedET = ($("#inputGavEdgeTypes").val() || []).filter(function (v) { return v !== "__ALL__"; });
+  let vtList = selectedVT.length > 0 ? selectedVT : allVertexTypes;
+  let etList = selectedET.length > 0 ? selectedET : allEdgeTypes;
 
   // Count nodes and edges
   let totalNodes = 0;
@@ -3918,21 +4233,42 @@ function gavUpdateRamEstimate() {
   for (let i = 0; i < etList.length; i++)
     totalEdges += typeCounts[etList[i]] || 0;
 
-  // Count properties
-  let vertexPropInput = ($("#inputGavProperties").val() || "").trim();
-  let numVertexProps = 0;
-  if (vertexPropInput) {
-    numVertexProps = vertexPropInput.split(",").filter(function (p) { return p.trim() !== ""; }).length;
-  } else {
-    // All properties — estimate from schema
-    for (let i = 0; i < vtList.length; i++)
-      numVertexProps = Math.max(numVertexProps, typeProperties[vtList[i]] || 0);
+  // Helper: count effective properties for a list of types given a user input string
+  // Returns the max effective property count across all types in the list
+  function countEffectiveProps(propInput, typeList) {
+    if (!propInput) {
+      // All properties — use max from schema
+      let maxProps = 0;
+      for (let i = 0; i < typeList.length; i++)
+        maxProps = Math.max(maxProps, typeProperties[typeList[i]] || 0);
+      return maxProps;
+    }
+    let propEntries = propInput.split(",").filter(function (p) { return p.trim() !== ""; });
+    let hasExclusions = propEntries.some(function (p) { return p.trim().startsWith("!"); });
+    if (hasExclusions) {
+      // Exclusion mode: for each type, count schema properties that are NOT excluded
+      let excludedNames = propEntries
+        .filter(function (p) { return p.trim().startsWith("!"); })
+        .map(function (p) { return p.trim().substring(1).trim().toLowerCase(); });
+      let maxProps = 0;
+      for (let i = 0; i < typeList.length; i++) {
+        let names = typePropertyNames[typeList[i]] || [];
+        let remaining = names.filter(function (n) {
+          return excludedNames.indexOf(n.toLowerCase()) < 0;
+        }).length;
+        maxProps = Math.max(maxProps, remaining);
+      }
+      return maxProps;
+    }
+    return propEntries.length;
   }
 
+  // Count properties
+  let vertexPropInput = ($("#inputGavProperties").val() || "").trim();
+  let numVertexProps = countEffectiveProps(vertexPropInput, vtList);
+
   let edgePropInput = ($("#inputGavEdgeProperties").val() || "").trim();
-  let numEdgeProps = 0;
-  if (edgePropInput)
-    numEdgeProps = edgePropInput.split(",").filter(function (p) { return p.trim() !== ""; }).length;
+  let numEdgeProps = countEffectiveProps(edgePropInput, etList);
 
   let updateMode = $("#inputGavUpdateMode").val();
 
@@ -4511,45 +4847,83 @@ function dropMaterializedView(name) {
 
 // ===== Flame Graph Visualization =====
 
-function renderFlameGraph(plan) {
+function renderFlameGraph(plan, profile) {
   var container = $("#flameGraphContainer");
-  if (!plan) {
-    container.html("");
-    return;
+  var html = "";
+
+  if (profile)
+    html += renderProfileBreakdown(profile);
+
+  if (plan && plan.steps && plan.steps.length > 0) {
+    var steps = plan.steps;
+    var hasCostData = stepsHaveCost(steps);
+    if (!hasCostData) {
+      html += "<div class='flame-no-data'><i class='fa fa-info-circle'></i> Enable <b>Profile Execution</b> to see cost data in the flame graph.</div>";
+    } else {
+      var totalCost = computeTotalCost(steps);
+      if (totalCost <= 0) {
+        html += "<div class='flame-no-data'><i class='fa fa-info-circle'></i> No measurable cost recorded.</div>";
+      } else {
+        html += "<div class='flame-graph'>";
+        html += "<div class='flame-graph-header'><i class='fa fa-fire'></i> Engine Execution Flame Graph</div>";
+        html += "<div class='flame-bar flame-depth-0' style='width:100%'";
+        html += " data-flame-tip='Engine execution &mdash; " + escapeHtml(formatCostNanos(totalCost)) + "'>";
+        html += "<span class='flame-label'>Engine <small>" + formatCostNanos(totalCost) + "</small></span>";
+        html += "</div>";
+        html += renderFlameRow(steps, totalCost, 1);
+        html += "</div>";
+      }
+    }
   }
 
-  var steps = plan.steps;
-  if (!steps || steps.length == 0) {
-    container.html("");
-    return;
-  }
-
-  // Check if any step has cost data (cost != -1)
-  var hasCostData = stepsHaveCost(steps);
-
-  if (!hasCostData) {
-    container.html("<div class='flame-no-data'><i class='fa fa-info-circle'></i> Enable <b>Profile Execution</b> to see cost data in the flame graph.</div>");
-    return;
-  }
-
-  var totalCost = computeTotalCost(steps);
-  if (totalCost <= 0) {
-    container.html("<div class='flame-no-data'><i class='fa fa-info-circle'></i> No measurable cost recorded.</div>");
-    return;
-  }
-
-  var html = "<div class='flame-graph'>";
-  html += "<div class='flame-graph-header'><i class='fa fa-fire'></i> Execution Flame Graph</div>";
-  // Root bar spanning full width showing total cost
-  html += "<div class='flame-bar flame-depth-0' style='width:100%'";
-  html += " data-flame-tip='Total execution &mdash; " + escapeHtml(formatCostNanos(totalCost)) + "'>";
-  html += "<span class='flame-label'>Total <small>" + formatCostNanos(totalCost) + "</small></span>";
-  html += "</div>";
-  // Render top-level steps as children, all relative to totalCost
-  html += renderFlameRow(steps, totalCost, 1);
-  html += "</div>";
   container.html(html);
   initFlameTooltips();
+}
+
+/**
+ * Renders a stacked horizontal bar showing how total request time is split
+ * across deserialization (payload parsing), engine execution and
+ * serialization (wire-format conversion). Values come from the server-side
+ * QueryProfile and reflect wall-clock nanoseconds per phase.
+ */
+function renderProfileBreakdown(profile) {
+  var deser = profile.deserializationNanos != null ? profile.deserializationNanos : 0;
+  var engine = profile.engineNanos != null ? profile.engineNanos : 0;
+  var ser = profile.serializationNanos != null ? profile.serializationNanos : 0;
+  var total = profile.totalNanos != null ? profile.totalNanos : (deser + engine + ser);
+  if (total <= 0) return "";
+
+  var phases = [
+    { name: "Deserialization", nanos: deser, cls: "profile-seg-deser" },
+    { name: "Engine",          nanos: engine, cls: "profile-seg-engine" },
+    { name: "Serialization",   nanos: ser,   cls: "profile-seg-ser" }
+  ];
+
+  var html = "<div class='flame-graph profile-breakdown'>";
+  html += "<div class='flame-graph-header'><i class='fa fa-stopwatch'></i> Query Profile &mdash; Total " + formatCostNanos(total) + "</div>";
+  html += "<div class='profile-bar'>";
+  for (var i = 0; i < phases.length; i++) {
+    var p = phases[i];
+    var pct = p.nanos > 0 ? (p.nanos / total * 100) : 0;
+    if (pct <= 0) continue;
+    var widthPct = Math.max(pct, 2);
+    var tip = escapeHtml(p.name) + " &mdash; " + escapeHtml(formatCostNanos(p.nanos)) + " (" + pct.toFixed(1) + "%)";
+    html += "<div class='profile-seg " + p.cls + "' style='width:" + widthPct + "%'";
+    html += " data-flame-tip='" + tip.replace(/'/g, "&#39;") + "'>";
+    html += "<span class='flame-label'>" + escapeHtml(p.name) + " <small>" + formatCostNanos(p.nanos) + "</small></span>";
+    html += "</div>";
+  }
+  html += "</div>";
+  html += "<div class='profile-legend'>";
+  for (var j = 0; j < phases.length; j++) {
+    var lp = phases[j];
+    var lpct = lp.nanos > 0 ? (lp.nanos / total * 100) : 0;
+    html += "<span class='profile-legend-item'><span class='profile-legend-swatch " + lp.cls + "'></span>";
+    html += escapeHtml(lp.name) + ": <b>" + formatCostNanos(lp.nanos) + "</b> <small>(" + lpct.toFixed(1) + "%)</small></span>";
+  }
+  html += "</div>";
+  html += "</div>";
+  return html;
 }
 
 /**
@@ -4595,7 +4969,7 @@ function initFlameTooltips() {
     $("body").append("<div id='flameTooltip' class='flame-tooltip'></div>");
     tip = $("#flameTooltip");
   }
-  $(".flame-bar[data-flame-tip]").on("mouseenter", function(e) {
+  $("[data-flame-tip]").on("mouseenter", function(e) {
     tip.html($(this).attr("data-flame-tip")).css({
       left: e.pageX + 12,
       top: e.pageY - 10

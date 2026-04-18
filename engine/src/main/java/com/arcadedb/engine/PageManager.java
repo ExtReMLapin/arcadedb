@@ -141,7 +141,7 @@ public class PageManager extends LockContext {
   public void suspendFlushAndExecute(final Database database, final CallableNoReturn callback)
       throws IOException, InterruptedException {
     if (flushThread.setSuspended(database, true)) {
-      flushThread.flushPagesFromQueueToDisk(database, 0L);
+      flushThread.waitForCurrentFlushToComplete(database);
       try {
         CodeUtils.executeIgnoringExceptions(callback, "Error during suspend flush", true);
       } finally {
@@ -254,8 +254,17 @@ public class PageManager extends LockContext {
       final List<MutablePage> pagesToWrite = new ArrayList<>((newPages != null ? newPages.size() : 0) + modifiedPages.size());
 
       if (newPages != null)
-        for (final MutablePage p : newPages.values())
+        for (final MutablePage p : newPages.values()) {
           pagesToWrite.add(updatePageVersion(p, true));
+
+          // Update page count eagerly so getTotalPages() reflects new pages immediately,
+          // even before the async flush thread writes them to disk
+          final PageId pid = p.getPageId();
+          final PaginatedComponent component = (PaginatedComponent) ((DatabaseInternal) pid.getDatabase()).getSchema()
+                  .getFileByIdIfExists(pid.getFileId());
+          if (component != null)
+            component.updatePageCount(pid.getPageNumber() + 1);
+        }
 
       for (final MutablePage p : modifiedPages.values())
         pagesToWrite.add(updatePageVersion(p, false));
@@ -333,10 +342,7 @@ public class PageManager extends LockContext {
   public void writePages(final List<MutablePage> updatedPages, final boolean asyncFlush) throws IOException, InterruptedException {
     if (asyncFlush) {
       for (final MutablePage page : updatedPages)
-        // SAVE A COPY OF THE PAGE IN CACHE BECAUSE IT WILL BE FLUSHED ASYNCHRONOUSLY
         putPageInReadCache(new CachedPage(page, true));
-
-      // ASYNCHRONOUS FLUSH: ONLY IF NOT ALREADY IN THE QUEUE, ENQUEUE THE PAGE TO BE FLUSHED BY A SEPARATE THREAD
       flushThread.scheduleFlushOfPages(updatedPages);
     } else {
       // SYNCHRONOUS FLUSH

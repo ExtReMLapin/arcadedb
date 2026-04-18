@@ -55,6 +55,7 @@ import com.arcadedb.query.opencypher.ast.UnwindClause;
 import com.arcadedb.query.opencypher.ast.VariableExpression;
 import com.arcadedb.query.opencypher.ast.WhereClause;
 import com.arcadedb.query.opencypher.ast.WithClause;
+import com.arcadedb.query.opencypher.executor.operators.GAVFusedChainOperator;
 import com.arcadedb.query.opencypher.executor.steps.AggregationStep;
 import com.arcadedb.query.opencypher.executor.steps.CallStep;
 import com.arcadedb.query.opencypher.executor.steps.AntiJoinChainOp;
@@ -88,12 +89,14 @@ import com.arcadedb.query.opencypher.executor.steps.ShortestPathStep;
 import com.arcadedb.query.opencypher.executor.steps.SkipStep;
 import com.arcadedb.query.opencypher.executor.steps.SubqueryStep;
 import com.arcadedb.query.opencypher.executor.steps.TypeCountStep;
+import com.arcadedb.query.opencypher.ast.UnionStatement;
 import com.arcadedb.query.opencypher.executor.steps.UnionStep;
 import com.arcadedb.query.opencypher.executor.steps.UnwindStep;
 import com.arcadedb.query.opencypher.executor.steps.VariableProjectionStep;
 import com.arcadedb.query.opencypher.executor.steps.WithStep;
 import com.arcadedb.query.opencypher.executor.steps.ZeroLengthPathStep;
 import com.arcadedb.query.opencypher.optimizer.plan.PhysicalPlan;
+import com.arcadedb.schema.EdgeType;
 import com.arcadedb.query.sql.executor.AbstractExecutionStep;
 import com.arcadedb.query.sql.executor.BasicCommandContext;
 import com.arcadedb.query.sql.executor.CommandContext;
@@ -283,6 +286,39 @@ public class CypherExecutionPlan {
    * @return result set from the inner query execution
    */
   public ResultSet executeWithSeedRow(final Result seedRow) {
+    // Handle UNION inside CALL subqueries: execute each branch with the seed row
+    if (statement instanceof UnionStatement unionStmt) {
+      final List<CypherExecutionPlan> branchPlans = new ArrayList<>();
+      for (final CypherStatement branch : unionStmt.getQueries())
+        branchPlans.add(new CypherExecutionPlan(database, branch, parameters, configuration, null, expressionEvaluator));
+
+      final boolean removeDuplicates = !unionStmt.isAllUnionAll();
+      final BasicCommandContext ctx = new BasicCommandContext();
+      ctx.setDatabase(database);
+      ctx.setInputParameters(parameters);
+      setupFunctionResolver(ctx);
+
+      // Execute each branch with the seed row, collect all results
+      final List<ResultInternal> allResults = new ArrayList<>();
+      final Set<String> seen = removeDuplicates ? new HashSet<>() : null;
+      for (final CypherExecutionPlan branchPlan : branchPlans) {
+        final ResultSet rs = branchPlan.executeWithSeedRow(seedRow);
+        while (rs.hasNext()) {
+          final Result row = rs.next();
+          if (removeDuplicates) {
+            final String key = buildResultKey(row);
+            if (!seen.add(key))
+              continue;
+          }
+          final ResultInternal copy = new ResultInternal();
+          for (final String prop : row.getPropertyNames())
+            copy.setProperty(prop, row.getProperty(prop));
+          allResults.add(copy);
+        }
+      }
+      return new IteratorResultSet(allResults.iterator());
+    }
+
     final BasicCommandContext context = new BasicCommandContext();
     context.setDatabase(database);
     context.setInputParameters(parameters);
@@ -322,6 +358,17 @@ public class CypherExecutionPlan {
       return new IteratorResultSet(new ArrayList<ResultInternal>().iterator());
 
     return rootStep.syncPull(context, 100);
+  }
+
+  private static String buildResultKey(final Result result) {
+    final StringBuilder sb = new StringBuilder();
+    for (final String prop : result.getPropertyNames()) {
+      sb.append(prop).append("=");
+      final Object value = result.getProperty(prop);
+      sb.append(value == null ? "null" : value.toString());
+      sb.append("|");
+    }
+    return sb.toString();
   }
 
   /**
@@ -537,139 +584,110 @@ public class CypherExecutionPlan {
       }
     };
 
-    // Apply post-MATCH operations using existing execution steps
-    // These are not yet optimized and use the original implementation
-
-    // Step 2: CREATE clause (if any)
-    if (statement.getCreateClause() != null && !statement.getCreateClause().isEmpty()) {
-      final CreateStep createStep = new CreateStep(statement.getCreateClause(), context, functionFactory);
-      createStep.setPrevious(currentStep);
-      currentStep = createStep;
-    }
-
-    // Step 3: SET clause (if any)
-    if (statement.getSetClause() != null && !statement.getSetClause().isEmpty()) {
-      final SetStep setStep =
-          new SetStep(statement.getSetClause(), context, functionFactory);
-      setStep.setPrevious(currentStep);
-      currentStep = setStep;
-    }
-
-    // Step 4: DELETE clause (if any)
-    if (statement.getDeleteClause() != null && !statement.getDeleteClause().isEmpty()) {
-      final DeleteStep deleteStep =
-          new DeleteStep(statement.getDeleteClause(), context);
-      deleteStep.setPrevious(currentStep);
-      currentStep = deleteStep;
-    }
-
-    // Step 4a: REMOVE clauses (if any)
-    for (final RemoveClause removeClause : statement.getRemoveClauses()) {
-      if (!removeClause.isEmpty()) {
-        final RemoveStep removeStep =
-            new RemoveStep(removeClause, context);
-        removeStep.setPrevious(currentStep);
-        currentStep = removeStep;
-      }
-    }
-
-    // Step 5: MERGE clause (if any)
-    if (statement.getMergeClause() != null) {
-      final MergeStep mergeStep =
-          new MergeStep(statement.getMergeClause(), context, functionFactory);
-      mergeStep.setPrevious(currentStep);
-      currentStep = mergeStep;
-    }
-
-    // Step 6: UNWIND clause (if any)
-    if (!statement.getUnwindClauses().isEmpty()) {
-      for (final UnwindClause unwind : statement.getUnwindClauses()) {
-        final UnwindStep unwindStep =
-            new UnwindStep(unwind, context, functionFactory);
-        unwindStep.setPrevious(currentStep);
-        currentStep = unwindStep;
-      }
-    }
-
-    // Step 6.5: WITH clauses (if any)
-    if (!statement.getWithClauses().isEmpty()) {
-      for (final WithClause withClause : statement.getWithClauses()) {
-        // Handle aggregations in WITH clause
-        if (withClause.hasAggregations()) {
-          if (withClause.hasNonAggregations()) {
-            // GROUP BY aggregation (implicit grouping)
-            final GroupByAggregationStep groupByStep =
-                new GroupByAggregationStep(
-                    new ReturnClause(withClause.getItems(), false),
-                    context, functionFactory);
-            groupByStep.setPrevious(currentStep);
-            currentStep = groupByStep;
-          } else {
-            // Pure aggregation (no grouping)
-            final AggregationStep aggStep =
-                new AggregationStep(
-                    new ReturnClause(withClause.getItems(), false),
-                    context, functionFactory);
-            aggStep.setPrevious(currentStep);
-            currentStep = aggStep;
-          }
-
-          // Apply WHERE clause after aggregation (post-aggregation filtering, like SQL HAVING)
-          if (withClause.getWhereClause() != null) {
+    // Apply post-MATCH operations using clausesInOrder to respect the order they appear
+    // in the query (e.g. WITH before UNWIND, not the other way around).
+    final List<ClauseEntry> clausesInOrder = statement.getClausesInOrder();
+    if (clausesInOrder != null) {
+      for (final ClauseEntry entry : clausesInOrder) {
+        switch (entry.getType()) {
+        case MATCH: {
+          // MATCH pattern is handled by the optimizer above, but WHERE clauses
+          // attached to MATCH clauses still need to be applied as filters.
+          final MatchClause matchClause = entry.getTypedClause();
+          if (matchClause.hasWhereClause()) {
             final FilterPropertiesStep filterStep =
-                new FilterPropertiesStep(withClause.getWhereClause(), context);
+                new FilterPropertiesStep(matchClause.getWhereClause(), context);
             filterStep.setPrevious(currentStep);
             currentStep = filterStep;
           }
-        } else {
-          // Regular WITH step (no aggregation)
-          final WithStep withStep =
-              new WithStep(withClause, context, functionFactory);
-          withStep.setPrevious(currentStep);
-          currentStep = withStep;
+          break;
         }
 
-        // Apply ORDER BY if present in WITH
-        if (withClause.getOrderByClause() != null) {
-          // Evaluate LIMIT before creating OrderByStep for Top-K optimization
-          // When SKIP is also present, TopK must keep SKIP + LIMIT results
-          Integer limitVal = withClause.getLimit() != null ?
-              new ExpressionEvaluator(functionFactory).evaluateSkipLimit(withClause.getLimit(),
-                  new ResultInternal(), context) : null;
-          final Integer originalLimitVal = limitVal;
-          if (limitVal != null && withClause.getSkip() != null) {
-            final int skipVal = new ExpressionEvaluator(functionFactory).evaluateSkipLimit(withClause.getSkip(),
-                new ResultInternal(), context);
-            limitVal = limitVal + skipVal;
+        case CREATE: {
+          final CreateClause createClause = entry.getTypedClause();
+          if (!createClause.isEmpty()) {
+            final CreateStep createStep = new CreateStep(createClause, context, functionFactory);
+            createStep.setPrevious(currentStep);
+            currentStep = createStep;
           }
+          break;
+        }
 
-          // Top-K must account for SKIP so enough rows survive after skipping
-          final Integer skipVal = withClause.getSkip() != null ?
-              new ExpressionEvaluator(functionFactory).evaluateSkipLimit(withClause.getSkip(),
-                  new ResultInternal(), context) : null;
-          final Integer topKVal = limitVal != null ? limitVal + (skipVal != null ? skipVal : 0) : null;
-
-          final OrderByStep orderByStep =
-              new OrderByStep(withClause.getOrderByClause(), context, functionFactory, topKVal);
-          orderByStep.setPrevious(currentStep);
-          currentStep = orderByStep;
-
-          // Chain SKIP/LIMIT after ORDER BY so pagination happens after sorting
-          if (skipVal != null) {
-            final SkipStep skipStep = new SkipStep(skipVal, context);
-            skipStep.setPrevious(currentStep);
-            currentStep = skipStep;
+        case SET: {
+          final SetClause setClause = entry.getTypedClause();
+          if (!setClause.isEmpty()) {
+            final SetStep setStep = new SetStep(setClause, context, functionFactory);
+            setStep.setPrevious(currentStep);
+            currentStep = setStep;
           }
-          if (withClause.getLimit() != null) {
-            final LimitStep limitStep = new LimitStep(originalLimitVal, context);
-            limitStep.setPrevious(currentStep);
-            currentStep = limitStep;
-          }
+          break;
+        }
 
-          // Strip non-projected variables that were kept for ORDER BY evaluation
-          currentStep = addWithProjection(withClause, currentStep, context);
+        case DELETE: {
+          final DeleteClause deleteClause = entry.getTypedClause();
+          if (!deleteClause.isEmpty()) {
+            final DeleteStep deleteStep = new DeleteStep(deleteClause, context);
+            deleteStep.setPrevious(currentStep);
+            currentStep = deleteStep;
+          }
+          break;
+        }
+
+        case REMOVE: {
+          final RemoveClause removeClause = entry.getTypedClause();
+          if (!removeClause.isEmpty()) {
+            final RemoveStep removeStep = new RemoveStep(removeClause, context);
+            removeStep.setPrevious(currentStep);
+            currentStep = removeStep;
+          }
+          break;
+        }
+
+        case MERGE: {
+          final MergeClause mergeClause = entry.getTypedClause();
+          final MergeStep mergeStep = new MergeStep(mergeClause, context, functionFactory);
+          mergeStep.setPrevious(currentStep);
+          currentStep = mergeStep;
+          break;
+        }
+
+        case UNWIND: {
+          final UnwindClause unwindClause = entry.getTypedClause();
+          final UnwindStep unwindStep = new UnwindStep(unwindClause, context, functionFactory);
+          unwindStep.setPrevious(currentStep);
+          currentStep = unwindStep;
+          break;
+        }
+
+        case WITH: {
+          final WithClause withClause = entry.getTypedClause();
+          currentStep = buildWithStepForOptimizer(withClause, currentStep, context, functionFactory);
+          break;
+        }
+
+        case LOAD_CSV: {
+          final LoadCSVClause loadCSVClause = entry.getTypedClause();
+          final LoadCSVStep loadCSVStep = new LoadCSVStep(loadCSVClause, context, functionFactory);
+          loadCSVStep.setPrevious(currentStep);
+          currentStep = loadCSVStep;
+          break;
+        }
+
+        case FOREACH:
+        case SUBQUERY:
+        case CALL:
+        case RETURN:
+          // Handled elsewhere or not applicable here
+          break;
         }
       }
+    }
+
+    // Statement-level WHERE clause (not scoped to any MATCH clause)
+    if (statement.getWhereClause() != null && currentStep != null) {
+      final FilterPropertiesStep filterStep = new FilterPropertiesStep(statement.getWhereClause(), context);
+      filterStep.setPrevious(currentStep);
+      currentStep = filterStep;
     }
 
     // Step 7: RETURN clause (if any)
@@ -1273,6 +1291,88 @@ public class CypherExecutionPlan {
   }
 
   /**
+   * Builds a WITH step for the optimizer path, including GAV fusion attempt for aggregations.
+   */
+  private AbstractExecutionStep buildWithStepForOptimizer(final WithClause withClause,
+      AbstractExecutionStep currentStep, final CommandContext context,
+      final CypherFunctionFactory functionFactory) {
+    if (withClause.hasAggregations()) {
+      if (withClause.hasNonAggregations()) {
+        // Try to fuse aggregation into the GAVFusedChainOperator for parallel count(*)
+        if (!tryFuseAggregationIntoChain(withClause, currentStep)) {
+          // Fallback: GROUP BY aggregation (implicit grouping)
+          final GroupByAggregationStep groupByStep =
+              new GroupByAggregationStep(
+                  new ReturnClause(withClause.getItems(), false),
+                  context, functionFactory);
+          groupByStep.setPrevious(currentStep);
+          currentStep = groupByStep;
+        }
+      } else {
+        // Pure aggregation (no grouping)
+        final AggregationStep aggStep =
+            new AggregationStep(
+                new ReturnClause(withClause.getItems(), false),
+                context, functionFactory);
+        aggStep.setPrevious(currentStep);
+        currentStep = aggStep;
+      }
+
+      // Apply WHERE clause after aggregation (post-aggregation filtering, like SQL HAVING)
+      if (withClause.getWhereClause() != null) {
+        final FilterPropertiesStep filterStep =
+            new FilterPropertiesStep(withClause.getWhereClause(), context);
+        filterStep.setPrevious(currentStep);
+        currentStep = filterStep;
+      }
+    } else {
+      // Regular WITH step (no aggregation)
+      final WithStep withStep =
+          new WithStep(withClause, context, functionFactory);
+      withStep.setPrevious(currentStep);
+      currentStep = withStep;
+    }
+
+    // Apply ORDER BY if present in WITH
+    if (withClause.getOrderByClause() != null) {
+      Integer limitVal = withClause.getLimit() != null ?
+          new ExpressionEvaluator(functionFactory).evaluateSkipLimit(withClause.getLimit(),
+              new ResultInternal(), context) : null;
+      final Integer originalLimitVal = limitVal;
+      if (limitVal != null && withClause.getSkip() != null) {
+        final int skipVal = new ExpressionEvaluator(functionFactory).evaluateSkipLimit(withClause.getSkip(),
+            new ResultInternal(), context);
+        limitVal = limitVal + skipVal;
+      }
+
+      final Integer skipVal = withClause.getSkip() != null ?
+          new ExpressionEvaluator(functionFactory).evaluateSkipLimit(withClause.getSkip(),
+              new ResultInternal(), context) : null;
+      final Integer topKVal = limitVal != null ? limitVal + (skipVal != null ? skipVal : 0) : null;
+
+      final OrderByStep orderByStep =
+          new OrderByStep(withClause.getOrderByClause(), context, functionFactory, topKVal);
+      orderByStep.setPrevious(currentStep);
+      currentStep = orderByStep;
+
+      if (skipVal != null) {
+        final SkipStep skipStep = new SkipStep(skipVal, context);
+        skipStep.setPrevious(currentStep);
+        currentStep = skipStep;
+      }
+      if (withClause.getLimit() != null) {
+        final LimitStep limitStep = new LimitStep(originalLimitVal, context);
+        limitStep.setPrevious(currentStep);
+        currentStep = limitStep;
+      }
+
+      currentStep = addWithProjection(withClause, currentStep, context);
+    }
+
+    return currentStep;
+  }
+
+  /**
    * Builds execution step for a MATCH clause.
    * Backward-compatible overload without bound variable tracking.
    */
@@ -1445,11 +1545,17 @@ public class CypherExecutionPlan {
           final String targetVar = targetNode.getVariable();
           if (targetVar != null && stepBeforeMatch != null
               && (boundVariables.contains(targetVar) || matchVariables.contains(targetVar))) {
-            // Target IS bound — reverse the traversal
-            reversed = true;
-            sourceNode = targetNode;
-            sourceVar = targetVar;
-            sourceAlreadyBound = true;
+            // Target IS bound - reverse the traversal for bidirectional edges only.
+            // Unidirectional edges don't store incoming links on the target vertex,
+            // so reverse traversal would return 0 results. In that case, keep the
+            // original direction and scan from the unbound source side.
+            final RelationshipPattern relCheck = pathPattern.getRelationship(0);
+            if (!isAnyEdgeTypeUnidirectional(relCheck.getTypes())) {
+              reversed = true;
+              sourceNode = targetNode;
+              sourceVar = targetVar;
+              sourceAlreadyBound = true;
+            }
           }
         }
 
@@ -1546,23 +1652,53 @@ public class CypherExecutionPlan {
             directionOverride = null;
           }
 
-          // Track relationship and target variables for cross-MATCH uniqueness scoping
-          if (relVar != null)
+          // Track relationship and target variables for cross-MATCH uniqueness scoping.
+          // Only add variables that are NEW to this MATCH clause — already-bound variables
+          // (from previous MATCHes or WITH) should not be treated as new match variables,
+          // otherwise OPTIONAL MATCH will incorrectly classify them when setting NULLs.
+          if (relVar != null && !boundVariables.contains(relVar))
             matchVariables.add(relVar);
-          matchVariables.add(effectiveTargetVar);
+          if (!boundVariables.contains(effectiveTargetVar))
+            matchVariables.add(effectiveTargetVar);
 
           AbstractExecutionStep nextStep;
           if (relPattern.isVariableLength()) {
             nextStep = new ExpandPathStep(effectiveSourceVar, pathVariable, relVar, effectiveTargetVar, relPattern,
-                true, effectiveTargetNode, context);
+                true, effectiveTargetNode, pathPattern.getEffectivePathMode(), context);
           } else {
-            // Pass target node pattern for label filtering, bound variables for identity
-            // checking, and a snapshot for relationship uniqueness scoping.
-            // The snapshot captures only variables from previous steps (via WITH/previous MATCHes).
-            // Relationship uniqueness only applies within a single MATCH clause.
-            nextStep = new MatchRelationshipStep(effectiveSourceVar, relVar, effectiveTargetVar, relPattern,
-                pathVariable, effectiveTargetNode, boundVariables, new HashSet<>(boundVariables),
-                directionOverride, context);
+            // Check if this hop requires IN traversal on a unidirectional edge.
+            // Unidirectional edges don't store incoming links, so we must restructure:
+            // instead of (bound)-[IN]->(target), scan target type and go (target)-[OUT]->(bound).
+            final Direction effectiveDir = directionOverride != null ? directionOverride : relPattern.getDirection();
+            final boolean needsReverseOnUnidirectional = !reversed
+                && effectiveDir == Direction.IN
+                && (boundVariables.contains(effectiveSourceVar) || matchVariables.contains(effectiveSourceVar))
+                && isAnyEdgeTypeUnidirectional(relPattern.getTypes());
+
+            if (needsReverseOnUnidirectional) {
+              // Restructure: scan target type with MatchNodeStep, then traverse OUT to validate
+              // against the bound source. The bound source becomes the "target" of the relationship.
+              final Set<String> boundWithSource = new HashSet<>(boundVariables);
+              boundWithSource.add(effectiveSourceVar);
+              final MatchNodeStep scanStep = new MatchNodeStep(effectiveTargetVar, effectiveTargetNode, context);
+              if (isOptional && matchChainStart == null) {
+                matchChainStart = scanStep;
+                currentStep = scanStep;
+              } else {
+                scanStep.setPrevious(currentStep);
+                currentStep = scanStep;
+              }
+              // Swap source/target and reverse direction: go OUT from scanned target to bound source
+              nextStep = new MatchRelationshipStep(effectiveTargetVar, relVar, effectiveSourceVar, relPattern,
+                  pathVariable, sourceNode, boundWithSource, new HashSet<>(boundVariables),
+                  Direction.OUT, context);
+            } else {
+              // Normal case: pass target node pattern for label filtering, bound variables for identity
+              // checking, and a snapshot for relationship uniqueness scoping.
+              nextStep = new MatchRelationshipStep(effectiveSourceVar, relVar, effectiveTargetVar, relPattern,
+                  pathVariable, effectiveTargetNode, boundVariables, new HashSet<>(boundVariables),
+                  directionOverride, context);
+            }
           }
 
           // Update source for next hop in multi-hop patterns
@@ -1892,7 +2028,7 @@ public class CypherExecutionPlan {
                   // Variable-length path - pass path variable, relationship variable, and target node for label
                   // filtering
                   nextStep = new ExpandPathStep(currentSourceVar, pathVariable, relVar, targetVar, relPattern, true,
-                      targetNode, context);
+                      targetNode, pathPattern.getEffectivePathMode(), context);
                 } else {
                   // Fixed-length relationship - pass path variable, target node pattern, and bound variables
                   nextStep = new MatchRelationshipStep(currentSourceVar, relVar, targetVar, relPattern, pathVariable,
@@ -2217,6 +2353,22 @@ public class CypherExecutionPlan {
    */
   public PhysicalPlan getPhysicalPlan() {
     return physicalPlan;
+  }
+
+  /**
+   * Checks if any of the given edge type names correspond to a unidirectional edge type.
+   * Unidirectional edges only store outgoing links on the source vertex - the target vertex
+   * has no incoming edge records. This means reverse traversal (IN direction) returns 0 results.
+   */
+  private boolean isAnyEdgeTypeUnidirectional(final List<String> edgeTypeNames) {
+    if (edgeTypeNames == null || edgeTypeNames.isEmpty())
+      return false;
+    for (final String typeName : edgeTypeNames)
+      if (database.getSchema().existsType(typeName)
+          && database.getSchema().getType(typeName) instanceof EdgeType et
+          && !et.isBidirectional())
+        return true;
+    return false;
   }
 
   /**
@@ -2731,6 +2883,49 @@ public class CypherExecutionPlan {
    *
    * @return optimized CountEdgesReturnStep if pattern matches, null otherwise
    */
+  /**
+   * Tries to fuse a GROUP BY count(*) aggregation into the GAVFusedChainOperator.
+   * When successful, the chain aggregates internally in parallel — bypassing the
+   * single-threaded GroupByAggregationStep entirely.
+   *
+   * @return true if fused successfully, false to fall back to GroupByAggregationStep
+   */
+  private boolean tryFuseAggregationIntoChain(final WithClause withClause,
+      final AbstractExecutionStep currentStep) {
+    if (physicalPlan == null || !(physicalPlan.getRootOperator() instanceof GAVFusedChainOperator))
+      return false;
+
+    // Check WITH items: need non-aggregated grouping keys + exactly one count(*) or count(var)
+    final List<String> groupVarNames = new ArrayList<>();
+    final List<String> groupOutputNames = new ArrayList<>();
+    String countOutput = null;
+    int aggCount = 0;
+
+    for (final var item : withClause.getItems()) {
+      final Expression expr = item.getExpression();
+      if (expr.isAggregation() && expr instanceof FunctionCallExpression funcExpr) {
+        if (!"count".equals(funcExpr.getFunctionName()) || funcExpr.isDistinct())
+          return false;
+        aggCount++;
+        countOutput = item.getOutputName();
+      } else if (expr instanceof VariableExpression varExpr) {
+        groupVarNames.add(varExpr.getVariableName());
+        groupOutputNames.add(item.getOutputName() != null ? item.getOutputName() : varExpr.getVariableName());
+      } else
+        return false; // complex grouping expression — can't fuse
+    }
+
+    if (aggCount != 1 || countOutput == null || groupVarNames.size() > 2)
+      return false; // only support 1-2 grouping keys packed into a long
+
+    final GAVFusedChainOperator chain = (GAVFusedChainOperator) physicalPlan.getRootOperator();
+    chain.setFusedAggregation(
+        groupVarNames.toArray(new String[0]),
+        groupOutputNames.toArray(new String[0]),
+        countOutput);
+    return true;
+  }
+
   private AbstractExecutionStep tryOptimizeMatchCountReturn(
       final List<ClauseEntry> clausesInOrder,
       final ReturnClause returnClause,
@@ -2742,17 +2937,21 @@ public class CypherExecutionPlan {
     if (returnClause.isDistinct())
       return null;
 
-    // Find the single non-optional MATCH clause
+    // Find the single non-optional MATCH clause.
+    // Bail out if any OPTIONAL MATCH, WITH, or UNWIND exists — the optimization only
+    // works for simple MATCH...RETURN patterns without intermediate transformations.
     MatchClause matchClause = null;
     int matchCount = 0;
     for (final ClauseEntry entry : clausesInOrder) {
       if (entry.getType() == ClauseEntry.ClauseType.MATCH) {
         final MatchClause mc = entry.getTypedClause();
-        if (!mc.isOptional()) {
-          matchClause = mc;
-          matchCount++;
-        }
-      }
+        if (mc.isOptional())
+          return null;
+        matchClause = mc;
+        matchCount++;
+      } else if (entry.getType() == ClauseEntry.ClauseType.WITH
+          || entry.getType() == ClauseEntry.ClauseType.UNWIND)
+        return null; // Intermediate WITH/UNWIND changes the result set shape
     }
     if (matchCount != 1 || matchClause == null)
       return null;
@@ -2780,14 +2979,16 @@ public class CypherExecutionPlan {
     final NodePattern targetNode = pathPattern.getLastNode();
     final String sourceVar = sourceNode.getVariable();
     final String targetVar = targetNode.getVariable();
-    if (sourceVar == null || targetVar == null)
+
+    // At least one side must have a variable
+    if (sourceVar == null && targetVar == null)
       return null;
 
-    // Target node must not have labels (countEdges doesn't filter by target type)
-    if (targetNode.hasLabels())
-      return null;
     // Target node must not have property filters (would need filtering)
     if (targetNode.getProperties() != null && !targetNode.getProperties().isEmpty())
+      return null;
+    // Source node must not have property filters
+    if (sourceNode.getProperties() != null && !sourceNode.getProperties().isEmpty())
       return null;
 
     // Classify RETURN items into grouping and aggregation
@@ -2806,8 +3007,15 @@ public class CypherExecutionPlan {
           return null;
         if (funcExpr.isDistinct())
           return null;
-        if (funcExpr.getArguments().size() != 1 || !(funcExpr.getArguments().get(0) instanceof VariableExpression))
+
+        // Accept count(variable) or count(*) — in a single-hop MATCH, count(*) equals count(targetVar)
+        if (funcExpr.getArguments().size() == 1 && funcExpr.getArguments().get(0) instanceof VariableExpression) {
+          // count(variable) — variable must be target or source (the expand endpoint)
+        } else if (funcExpr.getArguments().size() == 1 && funcExpr.getArguments().get(0) instanceof StarExpression) {
+          // count(*) — equivalent to counting edges in single-hop MATCH
+        } else
           return null;
+
         countExpr = funcExpr;
         countAlias = item.getAlias() != null ? item.getAlias() : item.getExpression().getText();
       } else
@@ -2817,26 +3025,53 @@ public class CypherExecutionPlan {
     if (aggregationCount != 1 || countExpr == null)
       return null;
 
-    // The count argument must be the target variable
-    final String countArgVar = ((VariableExpression) countExpr.getArguments().get(0)).getVariableName();
-    if (!countArgVar.equals(targetVar))
+    // Determine which side is the anchor (the one with grouping keys) and which is the counted side
+    // Standard pattern: MATCH (anchor)-[:TYPE]->(counted) RETURN anchor.prop, count(counted)
+    // Reverse pattern: MATCH (:Type)-[:TYPE]->(anchor) RETURN anchor.prop, count(*)
+    final String countArgVar;
+    if (countExpr.getArguments().get(0) instanceof StarExpression)
+      countArgVar = null; // count(*) — edges will be counted from anchor side
+    else
+      countArgVar = ((VariableExpression) countExpr.getArguments().get(0)).getVariableName();
+
+    // Determine the anchor variable: the one used in grouping (non-aggregated RETURN items)
+    // For normal pattern: anchor=sourceVar, counted=targetVar
+    // For reverse pattern (Q9): anchor=targetVar (b:Badge), source has no variable
+    final String anchorVar;
+    final NodePattern anchorNode;
+    final Vertex.DIRECTION countDirection;
+
+    if (sourceVar != null && (countArgVar == null || countArgVar.equals(targetVar))) {
+      // Normal: anchor=source, count target's edges
+      anchorVar = sourceVar;
+      anchorNode = sourceNode;
+      final Direction relDirection = relPattern.getDirection();
+      countDirection = relDirection == Direction.OUT ? Vertex.DIRECTION.OUT
+          : relDirection == Direction.IN ? Vertex.DIRECTION.IN : Vertex.DIRECTION.BOTH;
+    } else if (targetVar != null && (countArgVar == null || countArgVar.equals(sourceVar))) {
+      // Reverse: anchor=target, count source's edges (reverse direction)
+      // This requires reverse traversal (IN direction at the target vertex), which only
+      // works for bidirectional edges. Unidirectional edges don't store incoming links.
+      if (isAnyEdgeTypeUnidirectional(relPattern.getTypes()))
+        return null;
+      anchorVar = targetVar;
+      anchorNode = targetNode;
+      final Direction relDirection = relPattern.getDirection();
+      // Reverse direction since we're counting from the other end
+      countDirection = relDirection == Direction.OUT ? Vertex.DIRECTION.IN
+          : relDirection == Direction.IN ? Vertex.DIRECTION.OUT : Vertex.DIRECTION.BOTH;
+    } else
       return null;
 
-    // Grouping expressions must not reference the target variable
-    for (final ReturnClause.ReturnItem item : groupingItems) {
-      if (item.getExpression().getText().contains(targetVar))
-        return null;
+    // Grouping expressions must not reference the counted variable
+    if (countArgVar != null) {
+      for (final ReturnClause.ReturnItem item : groupingItems) {
+        final String text = item.getExpression().getText();
+        // Check for exact variable reference or property access (e.g., "a" or "a.name")
+        if (text.equals(countArgVar) || text.startsWith(countArgVar + "."))
+          return null;
+      }
     }
-
-    // Compute direction from source's perspective
-    final Vertex.DIRECTION direction;
-    final Direction relDirection = relPattern.getDirection();
-    if (relDirection == Direction.OUT)
-      direction = Vertex.DIRECTION.OUT;
-    else if (relDirection == Direction.IN)
-      direction = Vertex.DIRECTION.IN;
-    else
-      direction = Vertex.DIRECTION.BOTH;
 
     // Edge types
     final List<String> relTypes = relPattern.getTypes();
@@ -2856,7 +3091,7 @@ public class CypherExecutionPlan {
     // Walk back to find the MatchNodeStep — the previous step chain may vary:
     // - Legacy path: MatchNodeStep → MatchRelationshipStep (currentStep)
     // - Optimizer path: physical operator wrapper step (currentStep)
-    // In either case, we need the step that provides source vertices.
+    // In either case, we need the step that provides anchor vertices.
     AbstractExecutionStep nodeStep = currentStep;
     // Try to find MatchNodeStep: walk back through MatchRelationshipStep if present
     if (nodeStep instanceof MatchRelationshipStep) {
@@ -2865,15 +3100,16 @@ public class CypherExecutionPlan {
         return null;
     }
     // For optimizer path: the physical operator wrapper already handles the full traversal,
-    // so we need to rebuild with just a MatchNodeStep for the source variable.
-    if (!(nodeStep instanceof MatchNodeStep)) {
-      // Build a fresh MatchNodeStep for the source variable
-      final NodePattern srcPattern = sourceNode;
-      nodeStep = new MatchNodeStep(sourceVar, srcPattern, context);
-    }
+    // so we need to rebuild with just a MatchNodeStep for the anchor variable.
+    if (!(nodeStep instanceof MatchNodeStep))
+      nodeStep = new MatchNodeStep(anchorVar, anchorNode, context);
+
+    // Determine target label for filtering (the counted node's label, if any)
+    final NodePattern countedNode = anchorNode == sourceNode ? targetNode : sourceNode;
+    final String targetLabel = countedNode.hasLabels() ? countedNode.getLabels().get(0) : null;
 
     final CountEdgesReturnStep countStep = new CountEdgesReturnStep(
-        sourceVar, direction, edgeTypes, countAlias,
+        anchorVar, countDirection, edgeTypes, countAlias, targetLabel,
         groupingExpressions, groupingAliases, context,
         expressionEvaluator != null ? expressionEvaluator.getFunctionFactory() : null);
     countStep.setPrevious(nodeStep);
@@ -4353,11 +4589,13 @@ public class CypherExecutionPlan {
     if (expr instanceof ComparisonExpression) {
       final ComparisonExpression compExpr = (ComparisonExpression) expr;
 
-      // Check if left side is ID(variable)
+      // Check if left side is ID(variable) or elementId(variable)
       final Expression left = compExpr.getLeft();
       if (left instanceof FunctionCallExpression) {
         final FunctionCallExpression funcExpr = (FunctionCallExpression) left;
-        if ("id".equalsIgnoreCase(funcExpr.getFunctionName()) && funcExpr.getArguments().size() == 1) {
+        final String funcName = funcExpr.getFunctionName();
+        if (("id".equalsIgnoreCase(funcName) || "elementid".equalsIgnoreCase(funcName))
+            && funcExpr.getArguments().size() == 1) {
           final Expression arg = funcExpr.getArguments().get(0);
           if (arg instanceof VariableExpression) {
             final VariableExpression varExpr = (VariableExpression) arg;

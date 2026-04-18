@@ -25,8 +25,11 @@ import com.arcadedb.query.opencypher.executor.CypherExecutionPlan;
 import com.arcadedb.query.opencypher.executor.ExpressionEvaluator;
 import com.arcadedb.query.opencypher.optimizer.CypherOptimizer;
 import com.arcadedb.query.opencypher.optimizer.plan.PhysicalPlan;
+import com.arcadedb.schema.EdgeType;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +42,14 @@ import java.util.Set;
  * @author Luca Garulli (l.garulli--(at)--arcadedata.com)
  */
 public class CypherExecutionPlanner {
+  private static final Set<ClauseEntry.ClauseType> MUTATING_CLAUSES = EnumSet.of(
+      ClauseEntry.ClauseType.DELETE,
+      ClauseEntry.ClauseType.SET,
+      ClauseEntry.ClauseType.REMOVE,
+      ClauseEntry.ClauseType.CREATE,
+      ClauseEntry.ClauseType.MERGE
+  );
+
   private final DatabaseInternal    database;
   private final CypherStatement     statement;
   private final Map<String, Object> parameters;
@@ -126,18 +137,35 @@ public class CypherExecutionPlanner {
     if (statement.getMatchClauses() == null || statement.getMatchClauses().isEmpty())
       return false;
 
-    // Multiple MATCH clauses are supported when each MATCH has a simple single-node pattern
-    // (common for edge creation: MATCH (a:T) WHERE... MATCH (b:T) WHERE... CREATE (a)-[]->(b))
-    // These are handled via CartesianProduct operator. Complex multi-MATCH patterns are not yet supported.
+    // Multiple MATCH clauses: supported when the patterns form a connected graph via shared variables,
+    // or when each MATCH has a single-node pattern (handled via CartesianProduct).
     if (statement.getMatchClauses().size() > 1) {
+      final Set<String> allVariables = new HashSet<>();
+      boolean allConnected = true;
       for (final MatchClause match : statement.getMatchClauses()) {
-        if (!match.hasPathPatterns() || match.getPathPatterns().size() != 1)
-          return false;
+        if (!match.hasPathPatterns() || match.getPathPatterns().size() != 1) {
+          allConnected = false;
+          break;
+        }
         final PathPattern path = match.getPathPatterns().get(0);
-        // Only support single-node patterns (no relationships) for multi-MATCH
-        if (!path.isSingleNode())
-          return false;
+        // Collect all node variables from this path
+        final Set<String> pathVars = new HashSet<>();
+        for (final NodePattern node : path.getNodes())
+          if (node.getVariable() != null)
+            pathVars.add(node.getVariable());
+
+        // First clause always connects; subsequent clauses must share at least one variable
+        if (!allVariables.isEmpty() && Collections.disjoint(allVariables, pathVars)) {
+          // Disconnected pattern — only support if single-node (CartesianProduct)
+          if (!path.isSingleNode()) {
+            allConnected = false;
+            break;
+          }
+        }
+        allVariables.addAll(pathVars);
       }
+      if (!allConnected)
+        return false;
     }
 
     // For Phase 4: Start with simple queries only
@@ -147,15 +175,41 @@ public class CypherExecutionPlanner {
     // - Variable-length paths (already work but have known issues)
     // - Unlabeled nodes (optimizer requires labels for physical operators)
 
+    // Collect all labeled variables across all MATCH clauses first.
+    // A node like (a) in a second MATCH is valid if (a:Answer) appeared in a previous MATCH.
+    final Set<String> labeledVariables = new HashSet<>();
+    for (final MatchClause match : statement.getMatchClauses())
+      if (match.hasPathPatterns())
+        for (final PathPattern path : match.getPathPatterns())
+          for (final NodePattern node : path.getNodes())
+            if (node.getVariable() != null && node.hasLabels())
+              labeledVariables.add(node.getVariable());
+
     // Check for OPTIONAL MATCH, unlabeled nodes, and disconnected patterns
     for (final MatchClause match : statement.getMatchClauses()) {
       if (match.isOptional())
         return false; // Not yet supported in optimizer
 
-      // Multiple path patterns in a single MATCH (e.g., MATCH (a:T1), (b:T2))
-      // require Cartesian product which the optimizer doesn't support yet
-      if (match.hasPathPatterns() && match.getPathPatterns().size() > 1)
-        return false;
+      // Multiple path patterns in a single MATCH (e.g., MATCH (a:X)-[:E1]->(b:Y), (a)<-[:E2]-(c:Z))
+      // are supported when the patterns share variables (the optimizer handles them via join planning).
+      // Disconnected patterns with no shared variables fall through to step-by-step interpretation.
+      if (match.hasPathPatterns() && match.getPathPatterns().size() > 1) {
+        final Set<String> seenVars = new HashSet<>();
+        boolean disconnected = false;
+        for (final PathPattern path : match.getPathPatterns()) {
+          final Set<String> pathVars = new HashSet<>();
+          for (final NodePattern node : path.getNodes())
+            if (node.getVariable() != null)
+              pathVars.add(node.getVariable());
+          if (!seenVars.isEmpty() && Collections.disjoint(seenVars, pathVars)) {
+            disconnected = true;
+            break;
+          }
+          seenVars.addAll(pathVars);
+        }
+        if (disconnected)
+          return false; // Disconnected patterns in single MATCH not supported by optimizer
+      }
 
       // Check if all nodes have labels, no named path variables, and no unsupported property constraints
       if (match.hasPathPatterns()) {
@@ -165,8 +219,24 @@ public class CypherExecutionPlanner {
             return false;
 
           for (final NodePattern node : path.getNodes()) {
-            if (!node.hasLabels())
-              return false; // Unlabeled nodes not supported yet
+            // Anonymous nodes (no variable) with unidirectional edges can't be handled
+            // by the optimizer's expansion chain - anchor validation can't re-anchor
+            // to a node that has no variable in the LogicalPlan.
+            if (node.getVariable() == null && path.getRelationshipCount() > 0) {
+              for (int ri = 0; ri < path.getRelationshipCount(); ri++) {
+                final RelationshipPattern relP = path.getRelationship(ri);
+                if (relP.hasTypes())
+                  for (final String typeName : relP.getTypes())
+                    if (database.getSchema().existsType(typeName)
+                        && database.getSchema().getType(typeName) instanceof EdgeType et
+                        && !et.isBidirectional())
+                      return false;
+              }
+            }
+
+            // Unlabeled nodes must have been labeled in another MATCH clause
+            if (!node.hasLabels() && (node.getVariable() == null || !labeledVariables.contains(node.getVariable())))
+              return false;
 
             // Multi-label nodes not yet supported in optimizer
             // NodeByLabelScan uses composite type name which doesn't match
@@ -184,45 +254,92 @@ public class CypherExecutionPlanner {
       }
     }
 
-    // The optimizer path (buildExecutionStepsWithOptimizer) only supports a fixed clause
-    // ordering: MATCH(es) → one CREATE → one SET → one DELETE → REMOVE → MERGE → RETURN.
-    // Disable for queries with clauses that break this assumption.
+    // The optimizer path (buildExecutionStepsWithOptimizer) applies clauses in a fixed order
+    // (MATCH → CREATE → SET → DELETE → REMOVE → MERGE → UNWIND → WITH → RETURN).
+    // This breaks queries where clause ordering matters, e.g. WITH before DELETE or UNWIND before SET.
+    // Fall back to ordered execution when write/mutating clauses are interleaved with WITH/UNWIND,
+    // or when MATCH appears after WITH (MATCH-WITH-MATCH pattern).
     if (statement.getClausesInOrder() != null) {
       int createCount = 0;
       int mergeCount = 0;
       int deleteCount = 0;
+      boolean seenWith = false;
+      boolean seenUnwind = false;
       for (final ClauseEntry clause : statement.getClausesInOrder()) {
         final ClauseEntry.ClauseType type = clause.getType();
-        if (type == ClauseEntry.ClauseType.FOREACH || type == ClauseEntry.ClauseType.WITH
-            || type == ClauseEntry.ClauseType.CALL)
+
+        // Validate ordering before updating state
+        if ((seenWith || seenUnwind) && MUTATING_CLAUSES.contains(type))
           return false;
-        if (type == ClauseEntry.ClauseType.CREATE)
+        if (seenWith && type == ClauseEntry.ClauseType.MATCH)
+          return false;
+
+        switch (type) {
+        case FOREACH:
+        case CALL:
+          return false;
+        case WITH:
+          seenWith = true;
+          break;
+        case UNWIND:
+          seenUnwind = true;
+          break;
+        case CREATE:
           createCount++;
-        else if (type == ClauseEntry.ClauseType.MERGE)
+          break;
+        case MERGE:
           mergeCount++;
-        else if (type == ClauseEntry.ClauseType.DELETE)
+          break;
+        case DELETE:
           deleteCount++;
+          break;
+        default:
+          break;
+        }
       }
       // Multiple CREATE/MERGE/DELETE clauses not handled by optimizer path
       if (createCount > 1 || mergeCount > 1 || (deleteCount > 0 && mergeCount > 0))
         return false;
     }
 
-    // Aggregation queries: the optimizer doesn't enforce Cypher's relationship uniqueness
-    // constraint (each edge matched at most once per MATCH clause). When all edge types in
-    // the pattern are disjoint, uniqueness is automatically satisfied (an edge has exactly
-    // one type), so the optimizer is safe. When types overlap, fall back to the traditional
-    // path which supports edge tracking AND GAV via MatchRelationshipStep.
-    if (statement.getReturnClause() != null && statement.getReturnClause().hasAggregations()) {
-      for (final MatchClause match : statement.getMatchClauses()) {
-        if (match.hasPathPatterns()) {
-          for (final PathPattern path : match.getPathPatterns()) {
-            if (!allEdgeTypesDisjoint(path))
-              return false;
-          }
-        }
-      }
+    // Unidirectional edges: the optimizer requires reverse traversal in several situations:
+    // 1. Patterns like (a)<-[:TYPE]-(b) with IN direction
+    // 2. Multi-MATCH patterns where the target is bound from a previous MATCH
+    // 3. Anchor selection on the target side of an OUT relationship
+    // Unidirectional edges don't store incoming links on the target vertex, so reverse
+    // traversal returns 0 results. Bail out to the traditional path which handles these
+    // cases by scanning from the source side with forward direction.
+    {
+      boolean hasUnidirectionalEdge = false;
+      for (final MatchClause match : statement.getMatchClauses())
+        if (match.hasPathPatterns())
+          for (final PathPattern path : match.getPathPatterns())
+            for (int i = 0; i < path.getRelationshipCount(); i++) {
+              final RelationshipPattern rel = path.getRelationship(i);
+              if (rel.hasTypes())
+                for (final String typeName : rel.getTypes())
+                  if (database.getSchema().existsType(typeName)
+                      && database.getSchema().getType(typeName) instanceof EdgeType et
+                      && !et.isBidirectional()) {
+                    hasUnidirectionalEdge = true;
+                    // IN direction always needs reverse traversal
+                    if (rel.getDirection() == Direction.IN)
+                      return false;
+                  }
+            }
+      // Multi-MATCH with shared variables + unidirectional edges: the optimizer would
+      // need to reverse direction for the second MATCH's bound target, which fails.
+      if (hasUnidirectionalEdge && statement.getMatchClauses().size() > 1)
+        return false;
     }
+
+    // Aggregation queries: the optimizer doesn't enforce Cypher's relationship uniqueness
+    // constraint (each edge matched at most once per MATCH clause). Edge uniqueness is scoped
+    // to each individual MATCH clause, NOT across clauses. The CountOp detectors
+    // (PropagateChainOp, AntiJoinChainOp, PairHashJoinOp) handle duplicate edge types
+    // correctly - they count tuples, not distinct edges. So we allow duplicate edge types
+    // through to the optimizer; the CountOp fast paths and the GAVFusedChainOperator
+    // both produce correct results regardless of edge type overlap.
 
     return true;
   }

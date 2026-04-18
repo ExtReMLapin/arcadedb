@@ -73,7 +73,9 @@ class LSMTreeIndexTest extends TestHelper {
 
       for (int i = 0; i < TOT; ++i) {
         final List<Integer> results = new ArrayList<>();
-        for (final Index index : indexes) {
+        for (final Ind
+
+             ex index : indexes) {
           if (index instanceof TypeIndex)
             continue;
 
@@ -1289,7 +1291,7 @@ class LSMTreeIndexTest extends TestHelper {
 
       // Check for start message
       boolean hasStartMessage = logMessages.stream()
-          .anyMatch(msg -> msg.contains("Building index") && msg.contains("properties"));
+          .anyMatch(msg -> msg.contains("Building index") && msg.contains("BuildTest") && msg.contains("text"));
       assertThat(hasStartMessage).isTrue();
 
       // Check for progress messages (should have at least 2 for 25000 records with 10K interval)

@@ -40,6 +40,17 @@ public final class VectorUtils {
   }
 
   /**
+   * Checks if a float vector is all zeros. Used to filter invalid vectors that would
+   * cause NaN in cosine similarity computation.
+   */
+  public static boolean isZeroVector(final float[] vector) {
+    for (final float v : vector)
+      if (v != 0.0f)
+        return false;
+    return true;
+  }
+
+  /**
    * Converts various object types to a float array.
    * Handles: float[], double[], Object[] (of Number), List (of Number).
    *
@@ -105,6 +116,12 @@ public final class VectorUtils {
   public static float[] convertToFloatArray(final Object vectorObj) {
     if (vectorObj instanceof float[] f)
       return f;
+    if (vectorObj instanceof double[] d) {
+      final float[] vector = new float[d.length];
+      for (int i = 0; i < d.length; i++)
+        vector[i] = (float) d[i];
+      return vector;
+    }
     if (vectorObj instanceof List<?> list) {
       final float[] vector = new float[list.size()];
       for (int i = 0; i < list.size(); i++)

@@ -21,13 +21,9 @@ package com.arcadedb.integration.importer;
 import com.arcadedb.Constants;
 import com.arcadedb.database.Database;
 import com.arcadedb.database.DatabaseFactory;
-import com.arcadedb.database.Identifiable;
-import com.arcadedb.exception.DuplicatedKeyException;
-import com.arcadedb.exception.NeedRetryException;
-import com.arcadedb.graph.MutableEdge;
+import com.arcadedb.database.RID;
+import com.arcadedb.graph.GraphBatch;
 import com.arcadedb.graph.MutableVertex;
-import com.arcadedb.graph.Vertex;
-import com.arcadedb.index.IndexCursor;
 import com.arcadedb.query.opencypher.Labels;
 import com.arcadedb.index.lsm.LSMTreeIndexAbstract;
 import com.arcadedb.schema.Schema;
@@ -48,7 +44,7 @@ import java.io.InputStreamReader;
 import java.math.BigDecimal;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -61,6 +57,13 @@ import java.util.zip.GZIPInputStream;
 /**
  * Importer of a Neo4j database exported in JSONL format. To export a Neo4j database follow the instructions in https://neo4j.com/labs/apoc/4.3/export/json/.
  * The resulting file contains one json per line.
+ * <br>
+ * Uses {@link GraphBatch} for high-performance bulk import: vertices are created with pre-allocated edge segments,
+ * and edges are buffered in flat primitive arrays then flushed sorted by vertex for sequential I/O.
+ * <br>
+ * ID mapping uses a primitive {@link LongLongMap} when Neo4j IDs are numeric (the common case with APOC exports),
+ * falling back to a {@code HashMap<String, Long>} for non-numeric IDs. The primitive map uses ~24 bytes/entry
+ * vs ~156 bytes/entry for a {@code HashMap<String, RID>}, saving ~85% RAM on large imports.
  * <br>
  * Neo4j is a registered mark of Neo4j, Inc.
  *
@@ -89,7 +92,12 @@ public class Neo4jImporter {
   private final        ImporterContext                context;
   private final        Map<String, Map<String, Type>> schemaProperties         = new HashMap<>();
   private final static SimpleDateFormat               dateTimeISO8601Format    = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
-  private static final int                            MAX_RETRIES              = 3;
+
+  // Neo4j ID -> packed ArcadeDB RID mapping, populated during vertex pass.
+  // Uses primitive LongLongMap for numeric IDs (common case), falls back to HashMap for non-numeric IDs.
+  private              LongLongMap                    numericIdMap;
+  private              Map<String, Long>              stringIdMap;
+  private              boolean                        useNumericIds            = true;
 
   public Neo4jImporter(final InputStream inputStream, final String... args) {
     parseArguments(args);
@@ -110,6 +118,7 @@ public class Neo4jImporter {
     this.database = database;
     this.context = context;
     this.closeDatabaseAfterImport = false;
+    initPackingConstants();
   }
 
   public static void main(final String[] args) throws IOException {
@@ -145,12 +154,12 @@ public class Neo4jImporter {
       log("- Creation of the schema: types, properties and indexes");
       syncSchema();
 
-      // PARSE THE FILE AGAIN TO CREATE VERTICES
+      // PARSE THE FILE AGAIN TO CREATE VERTICES USING GRAPHBATCH
       log("- Creation of vertices started");
       beginTimeVerticesCreation = System.currentTimeMillis();
       parseVertices();
 
-      // PARSE THE FILE AGAIN TO CREATE EDGES
+      // PARSE THE FILE AGAIN TO CREATE EDGES USING GRAPHBATCH
       log("- Creation of edges started: creating edges between vertices");
       beginTimeEdgesCreation = System.currentTimeMillis();
       parseEdges();
@@ -188,6 +197,8 @@ public class Neo4jImporter {
         log("- you can find your new ArcadeDB database in '" + database.getDatabasePath() + "'");
 
     } finally {
+      numericIdMap = null;
+      stringIdMap = null;
       if (database != null && closeDatabaseAfterImport)
         database.close();
     }
@@ -280,152 +291,262 @@ public class Neo4jImporter {
 
   private void parseVertices() throws IOException {
     final AtomicInteger lineNumber = new AtomicInteger();
+    numericIdMap = new LongLongMap(1024);
+    useNumericIds = true;
 
-    readFile(json -> {
-      lineNumber.incrementAndGet();
+    try (final GraphBatch batch = database.batch()
+        .withBidirectional(false)
+        .withWAL(false)
+        .withPreAllocateEdgeChunks(true)
+        .withCommitEvery(0)
+        .build()) {
 
-      switch (json.getString("type")) {
-      case "node":
-        context.parsed.incrementAndGet();
-        ++totalVerticesParsed;
-        if (context.parsed.get() > 0 && context.parsed.get() % 1_000_000 == 0) {
-          final long elapsed = System.currentTimeMillis() - beginTimeVerticesCreation;
-          log("- Status update: created %,d vertices, skipped %,d edges (%,d vertices/sec)", context.createdVertices.get(),
-              context.skippedEdges.get(), (context.createdVertices.get() / elapsed * 1000));
+      database.begin();
+
+      readFileSimple(json -> {
+        lineNumber.incrementAndGet();
+
+        switch (json.getString("type")) {
+        case "node":
+          context.parsed.incrementAndGet();
+          ++totalVerticesParsed;
+          if (context.parsed.get() > 0 && context.parsed.get() % 1_000_000 == 0) {
+            final long elapsed = System.currentTimeMillis() - beginTimeVerticesCreation;
+            log("- Status update: created %,d vertices, skipped %,d edges (%,d vertices/sec)", context.createdVertices.get(),
+                context.skippedEdges.get(), (context.createdVertices.get() / elapsed * 1000));
+          }
+
+          final Pair<String, List<String>> type = typeNameFromLabels(json);
+          if (type == null) {
+            log("- found vertex in line %d without labels. Skip it.", lineNumber.get());
+            context.warnings.incrementAndGet();
+            return null;
+          }
+
+          final String typeName = type.getFirst();
+          final String id = json.getString("id");
+
+          try {
+            final Map<String, Object> props;
+            if (json.has("properties"))
+              props = setProperties(json.getJSONObject("properties"), schemaProperties.get(typeName));
+            else
+              props = new HashMap<>();
+            props.put("id", id);
+
+            final MutableVertex vertex = batch.createVertex(typeName, props);
+            final long packedRID = packRID(vertex.getIdentity());
+            putId(id, packedRID);
+            context.createdVertices.incrementAndGet();
+
+            incrementVerticesByType(typeName);
+          } catch (Exception e) {
+            error("- Error on saving vertex with id %s: %s", id, e.getMessage());
+            context.errors.incrementAndGet();
+          }
+
+          if (context.createdVertices.get() > 0 && context.createdVertices.get() % batchSize == 0) {
+            database.commit();
+            database.begin();
+          }
+
+          break;
+
+        case "relationship":
+          context.skippedEdges.incrementAndGet();
+          break;
         }
 
-        final Pair<String, List<String>> type = typeNameFromLabels(json);
-        if (type == null) {
-          log("- found vertex in line %d without labels. Skip it.", lineNumber.get());
-          context.warnings.incrementAndGet();
-          return null;
-        }
+        if (parsingCallback != null)
+          parsingCallback.call(json);
 
-        final String typeName = type.getFirst();
+        return null;
+      });
 
-        final String id = json.getString("id");
-
-        try {
-          final MutableVertex vertex = database.newVertex(typeName);
-
-          if (json.has("properties"))
-            vertex.fromMap(setProperties(json.getJSONObject("properties"), schemaProperties.get(typeName)));
-          vertex.set("id", id);
-          vertex.save();
-          context.createdVertices.incrementAndGet();
-
-          incrementVerticesByType(typeName);
-        } catch (Exception e) {
-          error("- Error on saving vertex with id %s: %s", id, e.getMessage());
-          context.errors.incrementAndGet();
-        }
-
-        break;
-
-      case "relationship":
-        context.skippedEdges.incrementAndGet();
-        break;
-      }
-
-      if (parsingCallback != null)
-        parsingCallback.call(json);
-
-      return null;
-    });
+      if (database.isTransactionActive())
+        database.commit();
+    }
 
     final long elapsedInSecs = (System.currentTimeMillis() - context.startedOn) / 1000;
 
     log("- Creation of vertices completed: created %,d vertices, skipped %,d edges (%,d vertices/sec elapsed=%,d secs)",
         context.createdVertices.get(), context.skippedEdges.get(),
         elapsedInSecs > 0 ? (context.createdVertices.get() / elapsedInSecs) : 0, elapsedInSecs);
+    log("- ID mapping mode: %s", useNumericIds ? "numeric (primitive long[])" : "string (HashMap)");
   }
 
   private void parseEdges() throws IOException {
-    database.begin();
-
     final AtomicInteger lineNumber = new AtomicInteger();
 
-    readFile(json -> {
-      lineNumber.incrementAndGet();
+    try (final GraphBatch batch = database.batch()
+        .withBatchSize(batchSize)
+        .withBidirectional(true)
+        .withWAL(false)
+        .withCommitEvery(batchSize)
+        .build()) {
 
-      switch (json.getString("type")) {
-      case "node":
-        break;
+      readFileSimple(json -> {
+        lineNumber.incrementAndGet();
 
-      case "relationship":
-        context.parsed.incrementAndGet();
-        ++totalEdgesParsed;
-        if (context.parsed.get() > 0 && context.parsed.get() % 1_000_000 == 0) {
-          final long elapsed = System.currentTimeMillis() - beginTimeEdgesCreation;
-          log("- Status update: created %,d edges %s (%,d edges/sec)", context.createdEdges.get(), totalEdgesByType,
-              (context.createdEdges.get() / elapsed * 1000));
+        switch (json.getString("type")) {
+        case "node":
+          break;
+
+        case "relationship":
+          context.parsed.incrementAndGet();
+          ++totalEdgesParsed;
+          if (context.parsed.get() > 0 && context.parsed.get() % 1_000_000 == 0) {
+            final long elapsed = System.currentTimeMillis() - beginTimeEdgesCreation;
+            log("- Status update: created %,d edges %s (%,d edges/sec)", context.createdEdges.get(), totalEdgesByType,
+                (context.createdEdges.get() / elapsed * 1000));
+          }
+
+          final String type = json.getString("label");
+          if (type == null) {
+            log("- found edge in line %d without labels. Skip it.", lineNumber.get());
+            context.warnings.incrementAndGet();
+            return null;
+          }
+
+          final JSONObject start = json.getJSONObject("start");
+          final String startId = start.getString("id");
+          final long fromPacked = getId(startId);
+          if (fromPacked == LongLongMap.EMPTY) {
+            log("- cannot create relationship with id '%s'. Vertex id '%s' not found. Skip it.", json.getString("id"), startId);
+            context.warnings.incrementAndGet();
+            return null;
+          }
+
+          final JSONObject end = json.getJSONObject("end");
+          final String endId = end.getString("id");
+          final long toPacked = getId(endId);
+          if (toPacked == LongLongMap.EMPTY) {
+            log("- cannot create relationship with id '%s'. Vertex id '%s' not found. Skip it.", json.getString("id"), endId);
+            context.warnings.incrementAndGet();
+            return null;
+          }
+
+          final RID fromRID = unpackRID(fromPacked);
+          final RID toRID = unpackRID(toPacked);
+
+          try {
+            if (json.has("properties")) {
+              final Map<String, Object> edgeProps = setProperties(json.getJSONObject("properties"), schemaProperties.get(type));
+              if (!edgeProps.isEmpty()) {
+                // Flatten map to key-value array for GraphBatch
+                final Object[] propsArray = new Object[edgeProps.size() * 2];
+                int i = 0;
+                for (final Map.Entry<String, Object> entry : edgeProps.entrySet()) {
+                  propsArray[i++] = entry.getKey();
+                  propsArray[i++] = entry.getValue();
+                }
+                batch.newEdge(fromRID, type, toRID, propsArray);
+              } else
+                batch.newEdge(fromRID, type, toRID);
+            } else
+              batch.newEdge(fromRID, type, toRID);
+
+            context.createdEdges.incrementAndGet();
+            incrementEdgesByType(type);
+          } catch (Exception e) {
+            error("- Error on saving edge between %s and %s: %s", fromRID, toRID, e.getMessage());
+            context.errors.incrementAndGet();
+          }
+
+          break;
         }
 
-        final String type = json.getString("label");
-        if (type == null) {
-          log("- found edge in line %d without labels. Skip it.", lineNumber.get());
-          context.warnings.incrementAndGet();
-          return null;
-        }
+        if (parsingCallback != null)
+          parsingCallback.call(json);
 
-        final JSONObject start = json.getJSONObject("start");
-        final Pair<String, List<String>> startType = typeNameFromLabels(start);
-        final String startId = start.getString("id");
-
-        final IndexCursor beginCursor = database.lookupByKey(startType.getFirst(), "id", startId);
-        if (!beginCursor.hasNext()) {
-          log("- cannot create relationship with id '%s'. Vertex id '%s' not found in type '%s'. Skip it.", json.getString("id"),
-              startId, startType.getFirst());
-          context.warnings.incrementAndGet();
-          return null;
-        }
-
-        final Vertex fromVertex = beginCursor.next().asVertex();
-
-        final JSONObject end = json.getJSONObject("end");
-        final Pair<String, List<String>> endType = typeNameFromLabels(end);
-        final String endId = end.getString("id");
-
-        final IndexCursor endCursor = database.lookupByKey(endType.getFirst(), "id", endId);
-        if (!endCursor.hasNext()) {
-          log("- cannot create relationship with id '%s'. Vertex id '%s' not found for labels. Skip it.", json.getString("id"),
-              endId);
-          context.warnings.incrementAndGet();
-          return null;
-        }
-
-        final Identifiable toVertex = endCursor.next();
-
-        try {
-          final MutableEdge edge = fromVertex.newEdge(type, toVertex);
-
-          if (json.has("properties"))
-            edge.fromMap(setProperties(json.getJSONObject("properties"), schemaProperties.get(type)));
-          edge.save();
-          context.createdEdges.incrementAndGet();
-
-          incrementEdgesByType(type);
-        } catch (Exception e) {
-          error("- Error on saving edge between %s and %s: %s", fromVertex, toVertex, e.getMessage());
-          context.errors.incrementAndGet();
-        }
-
-        if (context.parsed.get() > 0 && context.parsed.get() % batchSize == 0) {
-          database.commit();
-          database.begin();
-        }
-        break;
-      }
-      return null;
-    });
-
-    database.commit();
+        return null;
+      });
+    }
 
     final long elapsedInSecs = (System.currentTimeMillis() - context.startedOn) / 1000;
 
-    log("- Creation of edged completed: created %,d edges, (%,d edges/sec elapsed=%,d secs)", context.createdEdges.get(),
+    log("- Creation of edges completed: created %,d edges, (%,d edges/sec elapsed=%,d secs)", context.createdEdges.get(),
         elapsedInSecs > 0 ? (context.createdEdges.get() / elapsedInSecs) : 0, elapsedInSecs);
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  ID mapping: numeric (primitive) or string (HashMap) mode
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Stores a Neo4j ID -> packed RID mapping. Tries numeric mode first; on the first non-numeric ID,
+   * migrates all existing entries to the string HashMap and switches permanently.
+   */
+  private void putId(final String id, final long packedRID) {
+    if (useNumericIds) {
+      try {
+        final long numericId = Long.parseLong(id);
+        numericIdMap.put(numericId, packedRID);
+        return;
+      } catch (final NumberFormatException e) {
+        // Non-numeric ID detected, migrate to string mode
+        migrateToStringMode();
+      }
+    }
+    stringIdMap.put(id, packedRID);
+  }
+
+  /**
+   * Looks up a Neo4j ID and returns the packed RID, or {@link LongLongMap#EMPTY} if not found.
+   */
+  private long getId(final String id) {
+    if (useNumericIds) {
+      try {
+        return numericIdMap.get(Long.parseLong(id));
+      } catch (final NumberFormatException e) {
+        return LongLongMap.EMPTY;
+      }
+    }
+    final Long packed = stringIdMap.get(id);
+    return packed != null ? packed : LongLongMap.EMPTY;
+  }
+
+  /**
+   * Migrates from primitive LongLongMap to HashMap when a non-numeric ID is encountered.
+   */
+  private void migrateToStringMode() {
+    log("- Non-numeric Neo4j ID detected, switching to string-based ID mapping");
+    useNumericIds = false;
+    stringIdMap = new HashMap<>(numericIdMap.size() * 2);
+    numericIdMap.forEach((key, value) -> stringIdMap.put(Long.toString(key), value));
+    numericIdMap = null;
+  }
+
+  // Bit layout for packing RID (bucketId, position) into a single long.
+  // Default: 10 bits for bucket (max 1,023) and 54 bits for position (max ~18 quadrillion).
+  // Adjustable via -bucketBits <n> to support databases with more buckets at the cost of position range.
+  private              int  bucketBits  = 10;
+  private              int  maxBucketId;
+  private              long posMask;
+
+  private void initPackingConstants() {
+    maxBucketId = (1 << bucketBits) - 1;
+    posMask = (1L << (64 - bucketBits)) - 1;
+  }
+
+  /** Packs a RID (bucketId, position) into a single long. */
+  private long packRID(final RID rid) {
+    final int bucketId = rid.getBucketId();
+    if (bucketId > maxBucketId)
+      throw new IllegalStateException(
+          "Bucket ID " + bucketId + " exceeds the " + bucketBits + "-bit maximum (" + maxBucketId
+              + "). Use -bucketBits <n> to increase (e.g. -bucketBits 16 supports up to 65,535 buckets).");
+    return ((long) bucketId << (64 - bucketBits)) | (rid.getPosition() & posMask);
+  }
+
+  /** Unpacks a long back into a RID. */
+  private RID unpackRID(final long packed) {
+    return new RID(null, (int) (packed >>> (64 - bucketBits)), packed & posMask);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  Property conversion
+  // ═══════════════════════════════════════════════════════════════════
 
   private Map<String, Object> setProperties(final JSONObject properties, final Map<String, Type> typeSchema) {
     final Map<String, Object> result = new HashMap<>();
@@ -471,84 +592,68 @@ public class Neo4jImporter {
     return file.getName().endsWith("gz") ? new GZIPInputStream(new FileInputStream(file)) : new FileInputStream(file);
   }
 
+  /**
+   * Reads the JSONL file line by line, calling the callback for each valid JSON record.
+   * Used by syncSchema (which only reads, no record creation) with its own transaction management.
+   */
   private void readFile(final Callable<Void, JSONObject> callback) throws IOException {
     database.begin();
 
     try (InputStream inputStream = openInputStream()) {
       try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, DatabaseFactory.getDefaultCharset()))) {
-        long lineNumberStartOfBatch = 0;
-        final List<String> transactionBuffer = new ArrayList<>(batchSize);
-
-        String line = null;
         for (long lineNumber = 0; ; ++lineNumber) {
           try {
-            line = reader.readLine();
-            if (line == null) {
-              if (database.isTransactionActive())
-                database.commit();
-              transactionBuffer.clear();
+            final String line = reader.readLine();
+            if (line == null)
               break;
+
+            final JSONObject json = new JSONObject(line);
+            final String type = json.getString("type");
+            if ("node".equals(type) || "relationship".equals(type))
+              callback.call(json);
+            else {
+              log("Invalid 'type' content on line %d of the input JSONL file. The line will be ignored. JSON: %s", lineNumber, line);
+              context.errors.incrementAndGet();
             }
-
-            transactionBuffer.add(line);
-
-            executeCallback(callback, line, lineNumber);
-
-            if (context.parsed.get() > 0 && context.parsed.get() % batchSize == 0 && database.isTransactionActive()) {
-              database.commit();
-              transactionBuffer.clear();
-              lineNumberStartOfBatch = lineNumber;
-              database.begin();
-            }
-
-          } catch (final NeedRetryException | DuplicatedKeyException e) {
-            log("Transaction commit in error (%s), retrying the last transaction batch max %d times", e.getMessage(), MAX_RETRIES);
-
-            // RETRY THE TRANSACTION
-            for (int retry = 0; retry < MAX_RETRIES; retry++) {
-              try {
-                if (database.isTransactionActive())
-                  database.rollback();
-                database.begin();
-
-                for (int i = 0; i < transactionBuffer.size(); i++) {
-                  line = transactionBuffer.get(i);
-                  executeCallback(callback, line, lineNumberStartOfBatch + i);
-                }
-
-                database.commit();
-                transactionBuffer.clear();
-                break;
-
-              } catch (final NeedRetryException | DuplicatedKeyException e2) {
-                log("Concurrent access to the database, retrying the last transaction batch (retry %d/%d)", retry + 1, MAX_RETRIES);
-              }
-            }
-
           } catch (final JSONException e) {
-            log("Error on parsing json on line %d of the input JSONL file. The line will be ignored. JSON: %s", lineNumber, line);
+            log("Error on parsing json on line %d of the input JSONL file. The line will be ignored.", lineNumber);
             context.errors.incrementAndGet();
           }
         }
       }
     }
+
+    if (database.isTransactionActive())
+      database.commit();
   }
 
-  private void executeCallback(final Callable<Void, JSONObject> callback, final String line, final long lineNumber) {
-    final JSONObject json = new JSONObject(line);
+  /**
+   * Simplified file reader for vertex/edge passes that use GraphBatch.
+   * GraphBatch handles its own transaction management, so this method just reads and dispatches.
+   */
+  private void readFileSimple(final Callable<Void, JSONObject> callback) throws IOException {
+    try (InputStream inputStream = openInputStream()) {
+      try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, DatabaseFactory.getDefaultCharset()))) {
+        for (long lineNumber = 0; ; ++lineNumber) {
+          try {
+            final String line = reader.readLine();
+            if (line == null)
+              break;
 
-    switch (json.getString("type")) {
-    case "node":
-      callback.call(json);
-      break;
-
-    case "relationship":
-      callback.call(json);
-      break;
-
-    default:
-      log("Invalid 'type' content on line %d of the input JSONL file. The line will be ignored. JSON: %s", lineNumber, line);
-      context.errors.incrementAndGet();
+            final JSONObject json = new JSONObject(line);
+            final String type = json.getString("type");
+            if ("node".equals(type) || "relationship".equals(type))
+              callback.call(json);
+            else {
+              log("Invalid 'type' content on line %d of the input JSONL file. The line will be ignored. JSON: %s", lineNumber, line);
+              context.errors.incrementAndGet();
+            }
+          } catch (final JSONException e) {
+            log("Error on parsing json on line %d of the input JSONL file. The line will be ignored.", lineNumber);
+            context.errors.incrementAndGet();
+          }
+        }
+      }
     }
   }
 
@@ -606,6 +711,7 @@ public class Neo4jImporter {
     log("-i <input-file>: path to the Neo4j export file in JSONL format");
     log("-o: overwrite an existent database");
     log("-decimalType <type>: use <type> for decimals. <type> can be FLOAT, DOUBLE and DECIMAL. By default decimalType is DECIMAL.");
+    log("-bucketBits <n>: bits for bucket ID in RID packing (default 10, max bucket ID 1,023). Increase if you have many types/buckets.");
   }
 
   private void parseArguments(final String... args) {
@@ -625,6 +731,8 @@ public class Neo4jImporter {
         state = "batchSize";
       else if (arg.equals("-decimalType"))
         state = "decimalType";
+      else if (arg.equals("-bucketBits"))
+        state = "bucketBits";
       else if (state != null) {
         if (state.equals("databasePath"))
           databasePath = arg;
@@ -634,7 +742,105 @@ public class Neo4jImporter {
           batchSize = Integer.parseInt(arg);
         else if (state.equals("decimalType"))
           typeForDecimals = Type.valueOf(arg.toUpperCase(Locale.ENGLISH));
+        else if (state.equals("bucketBits")) {
+          bucketBits = Integer.parseInt(arg);
+          if (bucketBits < 1 || bucketBits > 32)
+            syntaxError("bucketBits must be between 1 and 32");
+        }
       }
+    }
+
+    initPackingConstants();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  LongLongMap: open-addressing primitive long-to-long hash map
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Open-addressing hash map from primitive long to primitive long, with no object overhead.
+   * Uses ~24 bytes per entry at 70% load factor (16 bytes for key+value arrays + table overhead).
+   * Modeled after {@code GraphImporter.IntIntMap} but with long keys and values.
+   */
+  static final class LongLongMap {
+    static final long EMPTY = Long.MIN_VALUE;
+
+    private long[] keys;
+    private long[] values;
+    private int    mask;
+    private int    size;
+    private int    threshold;
+
+    LongLongMap(final int expected) {
+      int cap = Integer.highestOneBit(Math.max(16, (int) (expected / 0.7))) << 1;
+      keys = new long[cap];
+      values = new long[cap];
+      mask = cap - 1;
+      threshold = (int) (cap * 0.7);
+      Arrays.fill(keys, EMPTY);
+    }
+
+    void put(final long key, final long value) {
+      if (key == EMPTY)
+        throw new IllegalArgumentException("Key cannot be Long.MIN_VALUE (reserved as EMPTY sentinel)");
+      if (size >= threshold)
+        resize();
+      int i = index(key);
+      while (keys[i] != EMPTY && keys[i] != key)
+        i = (i + 1) & mask;
+      if (keys[i] == EMPTY)
+        size++;
+      keys[i] = key;
+      values[i] = value;
+    }
+
+    long get(final long key) {
+      int i = index(key);
+      while (keys[i] != EMPTY) {
+        if (keys[i] == key)
+          return values[i];
+        i = (i + 1) & mask;
+      }
+      return EMPTY;
+    }
+
+    int size() {
+      return size;
+    }
+
+    void forEach(final LongLongConsumer consumer) {
+      for (int i = 0; i < keys.length; i++)
+        if (keys[i] != EMPTY)
+          consumer.accept(keys[i], values[i]);
+    }
+
+    private int index(final long key) {
+      // Fibonacci hashing for good distribution
+      return (int) ((key * 0x9E3779B97F4A7C15L) >>> (64 - Integer.numberOfTrailingZeros(keys.length))) & mask;
+    }
+
+    private void resize() {
+      final int newCap = keys.length << 1;
+      final long[] oldKeys = keys;
+      final long[] oldValues = values;
+      keys = new long[newCap];
+      values = new long[newCap];
+      mask = newCap - 1;
+      threshold = (int) (newCap * 0.7);
+      Arrays.fill(keys, EMPTY);
+      for (int i = 0; i < oldKeys.length; i++)
+        if (oldKeys[i] != EMPTY) {
+          int j = index(oldKeys[i]);
+          while (keys[j] != EMPTY)
+            j = (j + 1) & mask;
+          keys[j] = oldKeys[i];
+          values[j] = oldValues[i];
+        }
+    }
+
+    @FunctionalInterface
+    interface LongLongConsumer {
+      void accept(long key, long value);
     }
   }
 }

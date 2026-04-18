@@ -22,14 +22,14 @@ import com.arcadedb.database.RID;
 import com.arcadedb.graph.Edge;
 import com.arcadedb.graph.Vertex;
 import com.arcadedb.query.opencypher.ast.Direction;
+import com.arcadedb.query.opencypher.ast.PathMode;
+import com.arcadedb.utility.RidHashSet;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
-import java.util.Set;
 
 /**
  * Depth-first graph traverser.
@@ -47,6 +47,12 @@ public class DepthFirstTraverser extends GraphTraverser {
       final Map<String, Object> edgePropertyFilters, final int minHops,
       final int maxHops, final boolean trackPaths, final boolean detectCycles) {
     super(direction, relationshipTypes, edgePropertyFilters, minHops, maxHops, trackPaths, detectCycles);
+  }
+
+  public DepthFirstTraverser(final Direction direction, final String[] relationshipTypes,
+      final Map<String, Object> edgePropertyFilters, final int minHops,
+      final int maxHops, final boolean trackPaths, final PathMode pathMode) {
+    super(direction, relationshipTypes, edgePropertyFilters, minHops, maxHops, trackPaths, pathMode);
   }
 
   @Override
@@ -67,11 +73,11 @@ public class DepthFirstTraverser extends GraphTraverser {
     private int currentIndex = 0;
 
     DFSVertexIterator(final Vertex startVertex) {
-      final Set<RID> visited = detectCycles ? createVisitedSet() : new HashSet<>();
+      final RidHashSet visited = createVisitedSet();
       performDFS(startVertex, 0, visited);
     }
 
-    private void performDFS(final Vertex vertex, final int depth, final Set<RID> visited) {
+    private void performDFS(final Vertex vertex, final int depth, final RidHashSet visited) {
       // Skip if already visited
       if (detectCycles && isVisited(vertex, visited)) {
         return;
@@ -148,11 +154,16 @@ public class DepthFirstTraverser extends GraphTraverser {
         if (!matchesPropertyFilter(edge))
           continue;
 
-        // Cypher relationship uniqueness: skip edges already used in this path
-        if (detectCycles && pathContainsEdge(path, edge))
+        // Path mode: TRAIL/ACYCLIC = edge uniqueness, WALK = no restriction
+        if (pathMode != PathMode.WALK && pathContainsEdge(path, edge))
           continue;
 
         final Vertex nextVertex = getOtherVertex(edge, vertex);
+
+        // ACYCLIC: also enforce vertex uniqueness
+        if (pathMode == PathMode.ACYCLIC && path.containsVertex(nextVertex))
+          continue;
+
         final TraversalPath newPath = new TraversalPath(path, edge, nextVertex);
         performDFS(newPath, depth + 1);
       }

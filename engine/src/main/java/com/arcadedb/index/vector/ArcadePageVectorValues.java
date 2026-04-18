@@ -23,8 +23,6 @@ import com.arcadedb.database.Document;
 import com.arcadedb.database.Record;
 import com.arcadedb.exception.RecordNotFoundException;
 import com.arcadedb.log.LogManager;
-import com.arcadedb.utility.MostUsedCache;
-
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
@@ -33,6 +31,7 @@ import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.*;
 
 /**
@@ -56,9 +55,14 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
   private final int[]                                            ordinalToVectorId;
   private final LSMVectorIndex                                   lsmIndex;         // Used for reading quantized vectors
 
+  // Sentinel vector returned for deleted/missing ordinals to prevent NPE in JVector's GraphSearcher (issue #3715).
+  // Uses Float.MIN_NORMAL to avoid division-by-zero with cosine similarity while giving very low similarity scores.
+  private final VectorFloat<?> deletedSentinelVector;
+
   // Cache for graph building - dramatically speeds up repeated vector access
-  // Bounded LFU cache to prevent unbounded memory growth during graph construction
-  private final MostUsedCache<Integer, VectorFloat<?>> vectorCache;
+  // Lock-free concurrent map to avoid mutex contention during parallel JVector graph build
+  private final ConcurrentHashMap<Integer, VectorFloat<?>> vectorCache;
+  private final int maxCacheSize;
 
   // Constructor for live reads (uses shared vectorIndex, no cache needed)
   public ArcadePageVectorValues(final DatabaseInternal database, final int dimensions, final String vectorPropertyName,
@@ -67,6 +71,7 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
   }
 
   // Constructor for live reads with LSM index reference (for quantization support)
+  // Includes a small bounded cache for search — JVector revisits nodes during beam search
   public ArcadePageVectorValues(final DatabaseInternal database, final int dimensions, final String vectorPropertyName,
       final VectorLocationIndex vectorIndex, final int[] ordinalToVectorId, final LSMVectorIndex lsmIndex) {
     this.database = database;
@@ -76,7 +81,10 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
     this.vectorSnapshot = null;
     this.ordinalToVectorId = ordinalToVectorId;
     this.lsmIndex = lsmIndex;
-    this.vectorCache = null; // No cache for live reads (search only reads each vector once)
+    // Small search-time cache: beam search revisits nodes during graph traversal
+    this.vectorCache = new ConcurrentHashMap<>(512);
+    this.maxCacheSize = 1024;
+    this.deletedSentinelVector = createDeletedSentinelVector(dimensions);
   }
 
   // Constructor for graph building (uses immutable snapshot + cache for performance)
@@ -103,7 +111,10 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
     this.vectorSnapshot = vectorSnapshot;
     this.ordinalToVectorId = ordinalToVectorId;
     this.lsmIndex = lsmIndex;
-    this.vectorCache = new MostUsedCache<>(cacheSize); // Bounded LFU cache for graph building
+    final int effectiveCacheSize = cacheSize <= 0 ? DEFAULT_CACHE_SIZE : cacheSize;
+    this.vectorCache = new ConcurrentHashMap<>(Math.min(effectiveCacheSize, 1_000_000)); // Lock-free cache for parallel graph building
+    this.maxCacheSize = effectiveCacheSize;
+    this.deletedSentinelVector = createDeletedSentinelVector(dimensions);
   }
 
   @Override
@@ -119,17 +130,15 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
   @Override
   public VectorFloat<?> getVector(final int ordinal) {
     if (ordinal < 0 || ordinalToVectorId == null || ordinal >= ordinalToVectorId.length)
-      return null;
+      return deletedSentinelVector;
 
     final int vectorId = ordinalToVectorId[ordinal];
 
     // Check cache first (for graph building - dramatically speeds up repeated access)
     if (vectorCache != null) {
-      synchronized (vectorCache) {
-        final VectorFloat<?> cached = vectorCache.get(vectorId);
-        if (cached != null)
-          return cached;
-      }
+      final VectorFloat<?> cached = vectorCache.get(vectorId);
+      if (cached != null)
+        return cached;
     }
 
     // Use snapshot if available (during graph building), otherwise use live vectorIndex
@@ -142,7 +151,10 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
       loc = null;
 
     if (loc == null || loc.deleted)
-      return null;
+      // Return sentinel instead of null for deleted/missing entries (issue #3715).
+      // JVector's GraphSearcher traverses deleted ordinals in the stale HNSW graph and
+      // calls .length() on the vector, causing NPE if null. Results are filtered in post-processing.
+      return deletedSentinelVector;
 
     // Phase 2: Try reading from graph file first if vectors are stored inline
     // Only during search (vectorSnapshot == null), NOT during graph building (vectorSnapshot != null)
@@ -158,11 +170,8 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
             // Track fetch source for metrics
             lsmIndex.metrics.incrementVectorFetchFromGraph();
 
-            if (vectorCache != null) {
-              synchronized (vectorCache) {
-                vectorCache.put(vectorId, vector);
-              }
-            }
+            if (vectorCache != null && vectorCache.size() < maxCacheSize)
+              vectorCache.put(vectorId, vector);
 
             return vector;
           }
@@ -215,7 +224,7 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
               "Vector property '%s' not found in document %s (ordinal=%d). Available properties: %s",
               vectorPropertyName, loc.rid, ordinal, doc.getPropertyNames());
         }
-        return null; // Property not found
+        return deletedSentinelVector;
       }
 
       final float[] vector = VectorUtils.convertToFloatArray(vectorObj);
@@ -223,27 +232,18 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
         LogManager.instance().log(this, Level.WARNING,
             "Vector property '%s' is not float[] or List (type=%s, RID=%s)",
             vectorPropertyName, vectorObj.getClass().getName(), loc.rid);
-        return null;
+        return deletedSentinelVector;
       }
 
       if (vector.length != dimensions) {
         LogManager.instance().log(this, Level.WARNING,
             "Vector dimension mismatch: expected %d, got %d (RID=%s)",
             dimensions, vector.length, loc.rid);
-        return null;
+        return deletedSentinelVector;
       }
 
-      // Safety check: Validate vector is not all zeros (would cause NaN in cosine similarity)
-      boolean hasNonZero = false;
-      for (float v : vector) {
-        if (v != 0.0f) {
-          hasNonZero = true;
-          break;
-        }
-      }
-
-      if (!hasNonZero)
-        return null; // Zero vectors cause NaN in cosine similarity
+      if (VectorUtils.isZeroVector(vector))
+        return deletedSentinelVector;
 
       final VectorFloat<?> result = vts.createFloatVector(vector);
 
@@ -252,21 +252,18 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
         lsmIndex.metrics.incrementVectorFetchFromDocuments();
 
       // Cache the result if caching is enabled (for graph building performance)
-      if (vectorCache != null) {
-        synchronized (vectorCache) {
-          vectorCache.put(vectorId, result);
-        }
-      }
+      if (vectorCache != null && vectorCache.size() < maxCacheSize)
+        vectorCache.put(vectorId, result);
 
       return result;
 
     } catch (final RecordNotFoundException e) {
-      // DELETED RECORD
-      return null;
+      // DELETED RECORD — return sentinel to avoid NPE in JVector (issue #3715)
+      return deletedSentinelVector;
     } catch (final Exception e) {
       LogManager.instance().log(this, Level.WARNING,
           "Error reading vector from document (ordinal=%d, RID=%s): %s", ordinal, loc.rid, e.getMessage());
-      return null;
+      return deletedSentinelVector;
     }
   }
 
@@ -277,11 +274,8 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
    * without needing their own database context for lookupByRID.
    */
   public void putInCache(final int vectorId, final VectorFloat<?> vector) {
-    if (vectorCache != null && vector != null) {
-      synchronized (vectorCache) {
-        vectorCache.put(vectorId, vector);
-      }
-    }
+    if (vectorCache != null && vector != null)
+      vectorCache.put(vectorId, vector);
   }
 
   @Override
@@ -294,5 +288,16 @@ public class ArcadePageVectorValues implements RandomAccessVectorValues {
   public RandomAccessVectorValues copy() {
     // This implementation is thread-safe for reads (PageManager handles concurrency)
     return this;
+  }
+
+  /**
+   * Creates a sentinel vector for deleted/missing ordinals with small non-zero values.
+   * Uses Float.MIN_NORMAL to avoid division-by-zero in cosine similarity while producing
+   * very low similarity scores that effectively push deleted nodes to the bottom of results.
+   */
+  private static VectorFloat<?> createDeletedSentinelVector(final int dimensions) {
+    final float[] sentinel = new float[dimensions];
+    Arrays.fill(sentinel, Float.MIN_NORMAL);
+    return vts.createFloatVector(sentinel);
   }
 }
