@@ -1047,6 +1047,20 @@ class OpenCypherTemporalFunctionsComprehensiveTest {
   }
 
   @Test
+  void formatDurationWithPattern() {
+    // BUG #16: format() with a pattern is not supported for Duration values in ArcadeDB
+    // According to Neo4j docs, format() should support patterns for duration types
+    // Example: format(duration({years: 1, months: 4}), "y 'years' M 'months'") should work
+    final ResultSet result = database.command("opencypher",
+        "WITH duration({years: 1, months: 4}) AS d RETURN format(d, \"y 'years' M 'months'\") AS result");
+    Assertions.assertThat(result.hasNext() != false).isTrue();
+    final String formatted = (String) result.next().getProperty("result");
+    // Expected: "1 years 4 months" per Neo4j documentation
+    // Actual: throws error "format() with a pattern is not supported for Duration values"
+    assertThat(formatted).isEqualTo("1 years 4 months");
+  }
+
+  @Test
   void formatNull() {
     final ResultSet result = database.command("opencypher", "RETURN format(null) AS result");
     Assertions.assertThat(result.hasNext() != false).isTrue();

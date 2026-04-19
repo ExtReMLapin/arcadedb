@@ -659,6 +659,15 @@ class OpenCypherListFunctionsComprehensiveTest {
     assertThat(tail).isEmpty();
   }
 
+  @Test
+  void tailNull() {
+    // BUG: arcadedb returns [], neo4j returns null
+    // According to Neo4j documentation: tail(null) returns null
+    final ResultSet result = database.command("opencypher", "RETURN tail(null) AS result");
+    Assertions.assertThat(result.hasNext() != false).isTrue();
+    Assertions.assertThat(result.next().getProperty("result") == null).isTrue();
+  }
+
   // ==================== toBooleanList() Tests ====================
 
   @Test

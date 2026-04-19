@@ -256,6 +256,31 @@ class OpenCypherSpatialFunctionsComprehensiveTest {
     Assertions.assertThat(result.next().getProperty("distance") == null).isTrue();
   }
 
+  @Test
+  void pointDistanceDifferentCRSShouldReturnNull() {
+    // BUG #13: According to Neo4j docs, point.distance with different CRS should return null
+    // "Attempting to use points with different Coordinate Reference Systems (such as WGS 84 2D and WGS 84 3D) will return null."
+    // But ArcadeDB calculates distance anyway
+    final ResultSet result = database.command("opencypher",
+        "RETURN point.distance(point({x: 0.0, y: 0.0, crs: 'cartesian'}), point({x: 1.0, y: 1.0, crs: 'WGS-84'})) AS distance");
+    Assertions.assertThat(result.hasNext() != false).isTrue();
+    // Expected: null per Neo4j documentation
+    // Actual: 1.414... (calculates distance anyway)
+    Assertions.assertThat(result.next().getProperty("distance") == null).isTrue();
+  }
+
+  @Test
+  void pointDistance2DAnd3DCRSShouldReturnNull() {
+    // BUG #14: According to Neo4j docs, point.distance with 2D and 3D CRS should return null
+    // But ArcadeDB calculates distance anyway
+    final ResultSet result = database.command("opencypher",
+        "RETURN point.distance(point({x: 0.0, y: 0.0, crs: 'cartesian'}), point({x: 1.0, y: 1.0, z: 1.0, crs: 'cartesian-3D'})) AS distance");
+    Assertions.assertThat(result.hasNext() != false).isTrue();
+    // Expected: null per Neo4j documentation
+    // Actual: 1.414... (calculates distance anyway)
+    Assertions.assertThat(result.next().getProperty("distance") == null).isTrue();
+  }
+
   // ==================== point.withinBBox() Tests ====================
 
   @Test
@@ -322,6 +347,19 @@ class OpenCypherSpatialFunctionsComprehensiveTest {
     result = database.command("opencypher",
         "RETURN point.withinBBox(point({x: 5.0, y: 5.0}), point({x: 0.0, y: 0.0}), null) AS inside");
     Assertions.assertThat(result.hasNext() != false).isTrue();
+    Assertions.assertThat(result.next().getProperty("inside") == null).isTrue();
+  }
+
+  @Test
+  void pointWithinBBoxDifferentCRSShouldReturnNull() {
+    // BUG #15: According to Neo4j docs, point.withinBBox with different CRS should return null
+    // "Attempting to use POINT values with different Coordinate Reference Systems (such as WGS 84 2D and WGS 84 3D) will return null."
+    // But ArcadeDB returns true anyway
+    final ResultSet result = database.command("opencypher",
+        "RETURN point.withinBBox(point({x: 5.0, y: 5.0, crs: 'cartesian'}), point({x: 0.0, y: 0.0, crs: 'WGS-84'}), point({x: 10.0, y: 10.0, crs: 'WGS-84'})) AS inside");
+    Assertions.assertThat(result.hasNext() != false).isTrue();
+    // Expected: null per Neo4j documentation
+    // Actual: true (checks anyway)
     Assertions.assertThat(result.next().getProperty("inside") == null).isTrue();
   }
 
