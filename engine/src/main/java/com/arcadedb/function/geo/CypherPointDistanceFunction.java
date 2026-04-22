@@ -73,7 +73,6 @@ public class CypherPointDistanceFunction implements StatelessFunction {
     double sumSq = dx * dx + dy * dy;
     final Number z1n = (Number) p1.get("z");
     final Number z2n = (Number) p2.get("z");
-
     if ((z1n == null) != (z2n == null))
       return null;
     if (z1n != null) {
