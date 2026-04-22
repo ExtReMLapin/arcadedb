@@ -45,11 +45,6 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
     this.offset = offset;
   }
 
-  public RID(final BasicDatabase database, final int bucketId, final long offset) {
-    this.bucketId = bucketId;
-    this.offset = offset;
-  }
-
   public RID(final String value) {
     if (!value.startsWith("#"))
       throw new IllegalArgumentException("The RID '" + value + "' is not valid");
@@ -60,8 +55,20 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
     this.offset = Long.parseLong(parts.get(1));
   }
 
-  public RID(final BasicDatabase database, final String value) {
-    this(value);
+  /**
+   * Factory that returns a {@link DatabaseRID} when {@code database} is non-null, otherwise a bare {@link RID}. Use this at boundaries where the database
+   * reference is optional (e.g. deserialization paths, SQL conversions with nullable {@link com.arcadedb.query.sql.executor.CommandContext}) to avoid
+   * repeating the null-check at every call site.
+   */
+  public static RID create(final BasicDatabase database, final int bucketId, final long offset) {
+    return database != null ? database.newRID(bucketId, offset) : new RID(bucketId, offset);
+  }
+
+  /**
+   * String-form counterpart of {@link #create(BasicDatabase, int, long)}.
+   */
+  public static RID create(final BasicDatabase database, final String value) {
+    return database != null ? database.newRID(value) : new RID(value);
   }
 
   public static boolean is(final Object value) {
@@ -110,7 +117,7 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
 
   @Override
   public Record getRecord(final boolean loadContent) {
-    return requireDatabase().lookupByRID(this, loadContent);
+    return resolveActiveDatabase("getRecord").lookupByRID(this, loadContent);
   }
 
   public Document asDocument() {
@@ -118,7 +125,7 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
   }
 
   public Document asDocument(final boolean loadContent) {
-    return (Document) requireDatabase().lookupByRID(this, loadContent);
+    return (Document) resolveActiveDatabase("asDocument").lookupByRID(this, loadContent);
   }
 
   public Vertex asVertex() {
@@ -127,10 +134,10 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
 
   public Vertex asVertex(final boolean loadContent) {
     try {
-      return (Vertex) requireDatabase().lookupByRID(this, loadContent);
+      return (Vertex) resolveActiveDatabase("asVertex").lookupByRID(this, loadContent);
     } catch (final RecordNotFoundException e) {
       throw e;
-    } catch (final Exception e) {
+    } catch (final ClassCastException e) {
       throw new RecordNotFoundException("Record " + this + " not found", this, e);
     }
   }
@@ -140,7 +147,7 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
   }
 
   public Edge asEdge(final boolean loadContent) {
-    return (Edge) requireDatabase().lookupByRID(this, loadContent);
+    return (Edge) resolveActiveDatabase("asEdge").lookupByRID(this, loadContent);
   }
 
   @Override
@@ -187,22 +194,27 @@ public class RID implements Identifiable, Comparable<Object>, Serializable {
     return bucketId > -1 && offset > -1;
   }
 
-  public PageId getPageId() {
-    final BasicDatabase db = requireDatabase();
-    return new PageId(db, bucketId,
-        (int) (getPosition() / ((LocalBucket) db.getSchema().getBucketById(bucketId)).getMaxRecordsInPage()));
-  }
-
   public PageId getPageId(final BasicDatabase db) {
     return new PageId(db, bucketId,
         (int) (getPosition() / ((LocalBucket) db.getSchema().getBucketById(bucketId)).getMaxRecordsInPage()));
   }
 
-  private BasicDatabase requireDatabase() {
+  /**
+   * Resolves the database to use for record loading. Returns the single active database on the current thread if exactly one is in scope (the common single-DB
+   * case, matching pre-26.4.1 behaviour); throws otherwise - either because no database context is active, or because multiple databases are open with
+   * ambiguous active transactions. In multi-DB scenarios callers should hold a {@link DatabaseRID} (produced by {@code database.newRID(...)}) which resolves
+   * directly against the owning database and does not enter this path.
+   */
+  private BasicDatabase resolveActiveDatabase(final String op) {
     final BasicDatabase db = DatabaseContext.INSTANCE.getActiveDatabase();
     if (db == null)
-      throw new DatabaseOperationException(
-          "No active database context for RID " + this + ". Use database.lookupByRID() instead or ensure a database context is active on the current thread");
+      throw unboundRid(op);
     return db;
+  }
+
+  private DatabaseOperationException unboundRid(final String op) {
+    return new DatabaseOperationException(
+        "Cannot call " + op + "() on bare RID " + this
+            + ": no unambiguous active database on this thread. Either open a transaction on the owning database before calling, or use a DatabaseRID (e.g. database.newRID(...)) / database.lookupByRID(rid)");
   }
 }

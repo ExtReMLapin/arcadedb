@@ -50,6 +50,9 @@ import com.arcadedb.server.ArcadeDBServer;
 import com.arcadedb.server.grpc.InsertOptions.ConflictMode;
 import com.arcadedb.server.grpc.InsertOptions.TransactionMode;
 import com.arcadedb.server.grpc.ProjectionSettings.ProjectionEncoding;
+import com.arcadedb.server.monitor.QueryProfile;
+import com.arcadedb.server.monitor.ServerQueryProfiler;
+import io.micrometer.core.instrument.Metrics;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
@@ -80,6 +83,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -251,11 +255,17 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
                                                         Database db, boolean isExternalTransaction) {
 
     boolean beganHere = false;
+    final QueryProfile profile = new QueryProfile();
+    QueryProfile.pushCurrent(profile);
+    String profileLanguage = null;
 
     try {
+      final long deserStart = System.nanoTime();
       final Map<String, Object> params = GrpcTypeConverter.convertParameters(req.getParametersMap());
 
       final String language = langOrDefault(req.getLanguage());
+      profileLanguage = language;
+      profile.addDeserializationNanos(System.nanoTime() - deserStart);
 
       // Transaction: begin if requested
       final boolean hasTx = req.hasTransaction();
@@ -296,6 +306,9 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
       LogManager.instance().log(this, Level.FINE, "executeCommandInternal(): command = %s", req.getCommand());
 
+      long serializationAccum = 0L;
+      final long engineStart = System.nanoTime();
+
       try (ResultSet rs = db.command(language, req.getCommand(), params)) {
 
         if (rs != null) {
@@ -325,11 +338,12 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
               }
 
               if (emitted < maxRows) {
-
+                final long serRowStart = System.nanoTime();
                 // Convert Result to GrpcRecord, preserving aliases and all properties
                 GrpcRecord grpcRecord = convertResultToGrpcRecord(result, db,
                     new ProjectionConfig(true, ProjectionEncoding.PROJECTION_AS_JSON, 0));
                 out.addRecords(grpcRecord);
+                serializationAccum += System.nanoTime() - serRowStart;
 
                 emitted++;
               }
@@ -355,6 +369,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           }
         }
       }
+
+      final long engineEnd = System.nanoTime();
+      profile.addEngineNanos(engineEnd - engineStart - serializationAccum);
+      profile.addSerializationNanos(serializationAccum);
 
       LogManager.instance().log(this, Level.FINE, "executeCommandInternal(): after - hasTx = %s tx = %s", hasTx, tx);
 
@@ -392,8 +410,11 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       }
 
       final long ms = (System.nanoTime() - t0) / 1_000_000L;
+      final long serFinalStart = System.nanoTime();
       out.setAffectedRecords(affected).setExecutionTimeMs(ms);
-      return out.build();
+      final ExecuteCommandResponse response = out.build();
+      profile.addSerializationNanos(System.nanoTime() - serFinalStart);
+      return response;
 
     } catch (Exception e) {
 
@@ -419,7 +440,26 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           .setAffectedRecords(0L)
           .setExecutionTimeMs(ms)
           .build();
+    } finally {
+      recordGrpcProfile("grpc.command", profile, db != null ? db.getName() : req.getDatabase(),
+          profileLanguage != null ? profileLanguage : req.getLanguage(), req.getCommand());
+      QueryProfile.popCurrent();
     }
+  }
+
+  private void recordGrpcProfile(final String metricPrefix, final QueryProfile profile, final String databaseName,
+                                 final String language, final String queryText) {
+    Metrics.counter(metricPrefix).increment();
+    Metrics.timer(metricPrefix + ".deserialization").record(profile.getDeserializationNanos(), TimeUnit.NANOSECONDS);
+    Metrics.timer(metricPrefix + ".engine").record(profile.getEngineNanos(), TimeUnit.NANOSECONDS);
+    Metrics.timer(metricPrefix + ".serialization").record(profile.getSerializationNanos(), TimeUnit.NANOSECONDS);
+
+    if (arcadeServer == null)
+      return;
+    final ServerQueryProfiler serverProfiler = arcadeServer.getQueryProfiler();
+    if (serverProfiler == null || !serverProfiler.isRecording())
+      return;
+    serverProfiler.recordQuery(databaseName, language, queryText, profile, null);
   }
 
   @Override
@@ -508,8 +548,8 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         if (outStr == null || inStr == null)
           throw new IllegalArgumentException("Edge requires 'out' and 'in' RIDs");
 
-        final var outEl = db.lookupByRID(new RID(db, outStr), false);
-        final var inEl = db.lookupByRID(new RID(db, inStr), false);
+        final var outEl = db.lookupByRID(new RID(outStr), false);
+        final var inEl = db.lookupByRID(new RID(inStr), false);
         final Vertex outV = outEl.asVertex(false);
 
         final MutableEdge e = outV.newEdge(cls, inEl);
@@ -551,7 +591,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       if (ridStr == null || ridStr.isBlank())
         throw new IllegalArgumentException("rid is required");
 
-      var el = db.lookupByRID(new RID(db, ridStr), true);
+      var el = db.lookupByRID(new RID(ridStr), true);
 
       resp.onNext(LookupByRidResponse.newBuilder().setFound(true).setRecord(convertToGrpcRecord(el.getRecord(), db)).build());
       resp.onCompleted();
@@ -623,9 +663,8 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         beganHere = true;
       }
 
-      // Lookup the record by RID (use database-aware constructor so the returned
-      // record's RID carries the database reference needed by modify()/getPageId())
-      var el = db.lookupByRID(new RID(db, ridStr), true);
+      // Lookup the record by RID. BaseRecord upgrades the stored identity to a DatabaseRID at construction, so modify()/getPageId() stay correct.
+      var el = db.lookupByRID(new RID(ridStr), true);
 
       final var dbRef = db;
 
@@ -769,7 +808,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     }
 
     try {
-      final var el = db.lookupByRID(new RID(db, ridStr), false);
+      final var el = db.lookupByRID(new RID(ridStr), false);
       el.delete();
 
       if (beganHere) {
@@ -790,7 +829,12 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
   @Override
   public void executeQuery(ExecuteQueryRequest request, StreamObserver<ExecuteQueryResponse> responseObserver) {
+    final QueryProfile profile = new QueryProfile();
+    QueryProfile.pushCurrent(profile);
+    Database database = null;
+    String profileLanguage = null;
     try {
+      final long deserStart = System.nanoTime();
       ProjectionConfig projectionConfig = getProjectionConfig(request);
 
       LogManager.instance().log(this, Level.FINE, """
@@ -802,7 +846,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       // Force compression for streaming (usually beneficial)
       CompressionAwareService.setResponseCompression(responseObserver, "gzip");
 
-      Database database = getDatabase(request.getDatabase(), request.getCredentials());
+      database = getDatabase(request.getDatabase(), request.getCredentials());
 
       // Check if this is part of a transaction
       if (request.hasTransaction()) {
@@ -821,11 +865,16 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       long startTime = System.currentTimeMillis();
 
       final String language = langOrDefault(request.getLanguage());
+      profileLanguage = language;
 
       LogManager.instance().log(this, Level.FINE, "executeQuery(): language = %s query = %s", language, request.getQuery());
 
-      ResultSet resultSet = database.query(language, request.getQuery(),
-          GrpcTypeConverter.convertParameters(request.getParametersMap()));
+      final Map<String, Object> queryParams = GrpcTypeConverter.convertParameters(request.getParametersMap());
+      profile.addDeserializationNanos(System.nanoTime() - deserStart);
+
+      final long engineStart = System.nanoTime();
+      long serializationAccum = 0L;
+      ResultSet resultSet = database.query(language, request.getQuery(), queryParams);
 
       LogManager.instance()
           .log(this, Level.FINE, "executeQuery(): to get resultSet = %s", (System.currentTimeMillis() - startTime));
@@ -845,12 +894,14 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
         LogManager.instance().log(this, Level.FINE, "executeQuery(): result = %s", result);
 
+        final long serRowStart = System.nanoTime();
         // Convert Result to GrpcRecord, preserving aliases and all properties
         GrpcRecord grpcRecord = convertResultToGrpcRecord(result, database, projectionConfig);
 
         LogManager.instance().log(this, Level.FINE, "executeQuery(): grpcRecord -> @rid = %s", grpcRecord.getRid());
 
         resultBuilder.addRecords(grpcRecord);
+        serializationAccum += System.nanoTime() - serRowStart;
 
         count++;
 
@@ -859,9 +910,11 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           break;
         }
       }
+      profile.addEngineNanos(System.nanoTime() - engineStart - serializationAccum);
 
       LogManager.instance().log(this, Level.FINE, "executeQuery(): count = %s", count);
 
+      final long serBuildStart = System.nanoTime();
       resultBuilder.setTotalRecordsInBatch(count);
 
       long executionTime = System.currentTimeMillis() - startTime;
@@ -869,6 +922,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       ExecuteQueryResponse response = ExecuteQueryResponse.newBuilder().addResults(resultBuilder.build())
           .setExecutionTimeMs(executionTime)
           .build();
+      profile.addSerializationNanos(serializationAccum + (System.nanoTime() - serBuildStart));
 
       LogManager.instance().log(this, Level.FINE, "executeQuery(): executionTime + response generation = %s",
           executionTime);
@@ -879,6 +933,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     } catch (Exception e) {
       LogManager.instance().log(this, Level.SEVERE, "Error executing query: %s", e, e.getMessage());
       responseObserver.onError(Status.INTERNAL.withDescription("Query execution failed: " + e.getMessage()).asException());
+    } finally {
+      recordGrpcProfile("grpc.query", profile, database != null ? database.getName() : request.getDatabase(),
+          profileLanguage != null ? profileLanguage : request.getLanguage(), request.getQuery());
+      QueryProfile.popCurrent();
     }
   }
 
@@ -1087,6 +1145,9 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
   @Override
   public void streamQuery(StreamQueryRequest request, StreamObserver<QueryResult> responseObserver) {
+    final QueryProfile profile = new QueryProfile();
+    QueryProfile.pushCurrent(profile);
+    final long engineStart = System.nanoTime();
     ProjectionConfig projectionConfig = getProjectionConfigFromRequest(request);
 
     final ServerCallStreamObserver<QueryResult> scso = (ServerCallStreamObserver<QueryResult>) responseObserver;
@@ -1096,6 +1157,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
     Database db = null;
     boolean beganHere = false;
+    String profileLanguage = null;
 
     try {
       db = getDatabase(request.getDatabase(), request.getCredentials());
@@ -1110,6 +1172,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       }
 
       final String language = langOrDefault(request.getLanguage());
+      profileLanguage = language;
 
       // --- Dispatch on mode (helpers do NOT manage transactions) ---
       // PAGED mode uses SQL-specific SKIP/LIMIT wrapping, so fall back to CURSOR for non-SQL languages
@@ -1174,6 +1237,13 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       if (!cancelled.get()) {
         responseObserver.onError(Status.INTERNAL.withDescription("Stream query failed: " + e.getMessage()).asException());
       }
+    } finally {
+      // Stream endpoints mix engine iteration and row serialization throughout; expose the
+      // total cost as engineNanos so the Server Profiler still captures query-level metrics.
+      profile.addEngineNanos(System.nanoTime() - engineStart - profile.getEngineNanos());
+      recordGrpcProfile("grpc.stream", profile, db != null ? db.getName() : request.getDatabase(),
+          profileLanguage != null ? profileLanguage : request.getLanguage(), request.getQuery());
+      QueryProfile.popCurrent();
     }
   }
 
@@ -1656,10 +1726,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           }
         } catch (final Exception e) {
           errorSent[0] = true;
+          // Null batchRef so onCompleted skips processing; skip closeQuietly to avoid blocking the
+          // gRPC thread via async.waitCompletion() (buffered edges have no open transaction).
+          batchRef.set(null);
           resp.onError(Status.INTERNAL.withDescription("graphBatchLoad: " + e.getMessage()).asException());
-          // Note: closeQuietly may flush/commit partial data. GraphBatch has no rollback path by design
-          // (same as the HTTP batch endpoint). Callers should treat batch loading as non-atomic.
-          closeQuietly(batchRef.get());
           return;
         } finally {
           if (!cancelled.get() && !errorSent[0])
@@ -1669,11 +1739,13 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
       @Override
       public void onError(final Throwable t) {
-        closeQuietly(batchRef.get());
+        closeQuietly(batchRef.getAndSet(null));
       }
 
       @Override
       public void onCompleted() {
+        if (errorSent[0])
+          return;
         try {
           final GraphBatch batch = batchRef.get();
           if (batch == null) {
@@ -1728,7 +1800,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         throw new IllegalArgumentException("Malformed RID '" + ref + "'");
       final int bucketId = Integer.parseInt(ref.substring(1, colonIdx));
       final long position = Long.parseLong(ref.substring(colonIdx + 1));
-      return new RID(db, bucketId, position);
+      return db.newRID(bucketId, position);
     }
     final RID rid = tempIdMap.get(ref);
     if (rid == null)
@@ -2150,10 +2222,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
             c.errors.add(InsertError.newBuilder().setRowIndex(ctx.received - 1).setCode("MISSING_ENDPOINTS")
                 .setMessage("Edge requires 'out' and 'in'").build());
           } else {
-            var outV = ctx.db.lookupByRID(new RID(ctx.db, outRid), false).asVertex(false);
+            var outV = ctx.db.lookupByRID(new RID(outRid), false).asVertex(false);
 
-            // Create edge from the OUT vertex
-            MutableEdge e = outV.newEdge(ctx.opts.getTargetClass(), new RID(ctx.db, inRid));
+            // Create edge from the OUT vertex. The `in` RID is stored in the edge record; use DatabaseRID so edge.getIn() resolves across threads.
+            MutableEdge e = outV.newEdge(ctx.opts.getTargetClass(), ctx.db.newRID(inRid));
             applyGrpcRecord(e, r); // sets edge properties
             e.save();
             c.inserted++;

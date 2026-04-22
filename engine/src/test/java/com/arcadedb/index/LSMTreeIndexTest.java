@@ -614,7 +614,7 @@ class LSMTreeIndexTest extends TestHelper {
           final IndexCursor value = index.get(key);
           if (value.hasNext()) {
             assertThatThrownBy(() -> {
-              index.put(key, new RID[] { new RID(database, 10, 10) });
+              index.put(key, new RID[] { new RID(10, 10) });
               database.commit();
             }).isInstanceOf(DuplicatedKeyException.class);
             database.begin();
@@ -1289,7 +1289,7 @@ class LSMTreeIndexTest extends TestHelper {
 
       // Check for start message
       boolean hasStartMessage = logMessages.stream()
-          .anyMatch(msg -> msg.contains("Building index") && msg.contains("properties"));
+          .anyMatch(msg -> msg.contains("Building index") && msg.contains("BuildTest") && msg.contains("text"));
       assertThat(hasStartMessage).isTrue();
 
       // Check for progress messages (should have at least 2 for 25000 records with 10K interval)

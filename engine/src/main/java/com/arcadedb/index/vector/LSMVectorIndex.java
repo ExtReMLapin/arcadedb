@@ -23,6 +23,7 @@ import com.arcadedb.database.Binary;
 import com.arcadedb.database.DatabaseInternal;
 import com.arcadedb.database.Document;
 import com.arcadedb.database.Identifiable;
+import com.arcadedb.database.DatabaseRID;
 import com.arcadedb.database.RID;
 import com.arcadedb.database.Record;
 import com.arcadedb.database.TransactionContext;
@@ -2684,7 +2685,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
         case DOT_PRODUCT -> -score;
         default -> score;
       };
-      results.add(new Pair<>(delta.rid, distance));
+      results.add(new Pair<>(bindRid(delta.rid), distance));
       added = true;
     }
 
@@ -2730,7 +2731,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
         case DOT_PRODUCT -> -score;
         default -> score;
       };
-      results.add(new Pair<>(loc.rid, distance));
+      results.add(new Pair<>(bindRid(loc.rid), distance));
       added = true;
     }
 
@@ -2928,7 +2929,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
                     -score;
                 default -> score;
               };
-              results.add(new Pair<>(loc.rid, distance));
+              results.add(new Pair<>(bindRid(loc.rid), distance));
             } else {
               skippedDeletedOrNull++;
             }
@@ -3103,7 +3104,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
                 case DOT_PRODUCT -> -score;
                 default -> score;
               };
-              results.add(new Pair<>(loc.rid, distance));
+              results.add(new Pair<>(bindRid(loc.rid), distance));
             } else {
               skippedDeletedOrNull++;
             }
@@ -3518,6 +3519,14 @@ public class LSMVectorIndex implements Index, IndexInternal {
 
   public DatabaseInternal getDatabase() {
     return mutable.getDatabase();
+  }
+
+  /**
+   * Upgrade a bare internal-storage RID to a {@link DatabaseRID} bound to this index's database so callers can do {@code result.getFirst().asDocument()} without
+   * relying on thread-local database context.
+   */
+  private RID bindRid(final RID rid) {
+    return rid instanceof DatabaseRID ? rid : getDatabase().newRID(rid.getBucketId(), rid.getPosition());
   }
 
   public String getComponentName() {
@@ -4385,8 +4394,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
       final int numberOfEntries = page.readInt(OFFSET_NUM_ENTRIES);
 
       LogManager.instance().log(this, Level.FINE,
-          "applyReplicatedPageUpdate: index=%s, pageNum=%d, fileId=%d, entries=%d, freeContent=%d, vectorIndexSizeBefore=%d",
-          indexName, pageNum, fileId, numberOfEntries, offsetFreeContent, vectorIndex.size());
+          "applyReplicatedPageUpdate: index=%s, pageNum=%d, entries=%d, freeContent=%d, contentSize=%d",
+          indexName, pageNum, numberOfEntries, offsetFreeContent, page.getContentSize());
 
       if (numberOfEntries == 0)
         return; // Empty page, nothing to update
@@ -4424,11 +4433,30 @@ public class LSMVectorIndex implements Index, IndexInternal {
         final long position = positionAndSize[0];
         currentOffset += (int) positionAndSize[1];
 
-        final RID rid = new RID(getDatabase(), bucketId, position);
+        final RID rid = new RID(bucketId, position);
 
         // Read deleted flag (fixed 1 byte)
         final boolean deleted = page.readByte(currentOffset) == 1;
         currentOffset += 1;
+
+        // Read quantization type byte (always written, even if NONE)
+        final byte quantOrdinal = (byte) page.readByte(currentOffset);
+        currentOffset += 1;
+        final VectorQuantizationType quantType = quantOrdinal >= 0 && quantOrdinal < VectorQuantizationType.values().length
+            ? VectorQuantizationType.values()[quantOrdinal] : VectorQuantizationType.NONE;
+
+        // Skip quantized vector data based on type
+        if (quantType == VectorQuantizationType.INT8) {
+          final int vectorLength = page.readInt(currentOffset);
+          currentOffset += 4; // vector length (int)
+          currentOffset += vectorLength; // quantized bytes
+          currentOffset += 8; // min + max (2 floats)
+        } else if (quantType == VectorQuantizationType.BINARY) {
+          final int originalLength = page.readInt(currentOffset);
+          currentOffset += 4; // original length (int)
+          currentOffset += (originalLength + 7) / 8; // packed bytes (1 bit per dimension)
+          currentOffset += 4; // median (float)
+        }
 
         // Update VectorLocationIndex with this entry's absolute file offset
         // LSM semantics: later entries override earlier ones
@@ -4441,9 +4469,8 @@ public class LSMVectorIndex implements Index, IndexInternal {
               fileId, isCompacted, numberOfEntries);
 
     } catch (final Exception e) {
-      // Log but don't fail replication - VectorLocationIndex will be rebuilt if needed
       LogManager.instance()
-          .log(this, Level.WARNING, "Error applying replicated page update for index %s: %s", indexName,
+          .log(this, Level.SEVERE, "Error applying replicated page update for index %s: %s", e, indexName,
               e.getMessage());
     }
   }
@@ -4712,7 +4739,7 @@ public class LSMVectorIndex implements Index, IndexInternal {
             entryOffset += 4;
             final long position = currentPage.readLong(entryOffset);
             entryOffset += 8;
-            final RID rid = new RID(mutable.getDatabase(), bucketId, position);
+            final RID rid = new RID(bucketId, position);
 
             final byte flags = currentPage.readByte(entryOffset);
             entryOffset += 1;

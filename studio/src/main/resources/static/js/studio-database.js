@@ -1845,7 +1845,7 @@ function populateHistoryPanel() {
 
   // Quick-select with latest 10 queries
   let html = "<div class='history-quick-select'>";
-  html += "<select class='form-select form-select-sm history-quick-dropdown' onchange='executeQuickHistoryEntry(this)' title='Recent queries'>";
+  html += "<select class='form-select form-select-sm history-quick-dropdown' onchange='loadQuickHistoryEntry(this)' title='Load a recent query into the editor'>";
   html += "<option value='' selected disabled>Recent queries...</option>";
   let quickCount = Math.min(filtered.length, 10);
   for (let i = 0; i < quickCount; i++) {
@@ -1923,7 +1923,7 @@ function renderHistoryEntries(entries) {
 
     html += "<div class='history-entry' data-index='" + idx + "' data-cmd='" + cmd.toLowerCase() + "'>";
     html += "<input type='checkbox' class='history-checkbox history-item-check' data-index='" + idx + "' onclick='event.stopPropagation()'>";
-    html += "<div class='history-entry-content' onclick='executeHistoryEntry(" + idx + ")'>";
+    html += "<div class='history-entry-content' title='Click to load into the editor' onclick='loadHistoryEntry(" + idx + ")'>";
     html += "<div class='history-meta'>";
     if (time) html += "<span class='history-time'>" + time + "</span>";
     html += "<span class='history-lang'>" + lang + "</span>";
@@ -1934,16 +1934,20 @@ function renderHistoryEntries(entries) {
   return html;
 }
 
-function executeHistoryEntry(index) {
+function loadHistoryEntry(index) {
   let queryHistory = getQueryHistory();
   let q = queryHistory[index];
-  if (q) executeCommand(q.l, q.c);
+  if (!q) return;
+  if (q.l) $("#inputLanguage").val(q.l);
+  editor.setValue(q.c || "");
+  globalActivateTab("tab-query");
+  editor.focus();
 }
 
-function executeQuickHistoryEntry(selectEl) {
+function loadQuickHistoryEntry(selectEl) {
   let index = parseInt(selectEl.value);
   if (!isNaN(index)) {
-    executeHistoryEntry(index);
+    loadHistoryEntry(index);
     selectEl.selectedIndex = 0;
   }
 }
@@ -2659,7 +2663,7 @@ function browseType(typeName) {
   if (!database) return;
 
   let limit = parseInt($("#inputLimit").val()) || 100;
-  let query = "select from `" + typeName + "` limit " + limit;
+  let query = "select from `" + typeName + "`";
 
   // If a graph already exists, append results to it
   if (globalCy != null && globalResultset != null) {
@@ -2696,7 +2700,7 @@ function browseType(typeName) {
   if (!database) return;
 
   let limit = parseInt($("#inputLimit").val()) || 100;
-  let query = "select from `" + typeName + "` limit " + limit;
+  let query = "select from `" + typeName + "`";
 
   $("#inputLanguage").val("sql");
   editor.setValue(query);
@@ -2816,7 +2820,7 @@ function executeCommandTable() {
       $("#resultExplain").val(data.explain != null ? data.explain : "No profiler data found");
 
       globalExplainPlan = data.explainPlan || null;
-      renderFlameGraph(globalExplainPlan);
+      renderFlameGraph(globalExplainPlan, data.profile || null);
 
       globalResultset = data.result;
       globalCy = null;
@@ -2870,7 +2874,7 @@ function executeCommandGraph() {
       $("#resultExplain").val(data.explain != null ? data.explain : "No profiler data found");
 
       globalExplainPlan = data.explainPlan || null;
-      renderFlameGraph(globalExplainPlan);
+      renderFlameGraph(globalExplainPlan, data.profile || null);
 
       globalResultset = data.result;
       globalCy = null;
@@ -4847,45 +4851,83 @@ function dropMaterializedView(name) {
 
 // ===== Flame Graph Visualization =====
 
-function renderFlameGraph(plan) {
+function renderFlameGraph(plan, profile) {
   var container = $("#flameGraphContainer");
-  if (!plan) {
-    container.html("");
-    return;
+  var html = "";
+
+  if (profile)
+    html += renderProfileBreakdown(profile);
+
+  if (plan && plan.steps && plan.steps.length > 0) {
+    var steps = plan.steps;
+    var hasCostData = stepsHaveCost(steps);
+    if (!hasCostData) {
+      html += "<div class='flame-no-data'><i class='fa fa-info-circle'></i> Enable <b>Profile Execution</b> to see cost data in the flame graph.</div>";
+    } else {
+      var totalCost = computeTotalCost(steps);
+      if (totalCost <= 0) {
+        html += "<div class='flame-no-data'><i class='fa fa-info-circle'></i> No measurable cost recorded.</div>";
+      } else {
+        html += "<div class='flame-graph'>";
+        html += "<div class='flame-graph-header'><i class='fa fa-fire'></i> Engine Execution Flame Graph</div>";
+        html += "<div class='flame-bar flame-depth-0' style='width:100%'";
+        html += " data-flame-tip='Engine execution &mdash; " + escapeHtml(formatCostNanos(totalCost)) + "'>";
+        html += "<span class='flame-label'>Engine <small>" + formatCostNanos(totalCost) + "</small></span>";
+        html += "</div>";
+        html += renderFlameRow(steps, totalCost, 1);
+        html += "</div>";
+      }
+    }
   }
 
-  var steps = plan.steps;
-  if (!steps || steps.length == 0) {
-    container.html("");
-    return;
-  }
-
-  // Check if any step has cost data (cost != -1)
-  var hasCostData = stepsHaveCost(steps);
-
-  if (!hasCostData) {
-    container.html("<div class='flame-no-data'><i class='fa fa-info-circle'></i> Enable <b>Profile Execution</b> to see cost data in the flame graph.</div>");
-    return;
-  }
-
-  var totalCost = computeTotalCost(steps);
-  if (totalCost <= 0) {
-    container.html("<div class='flame-no-data'><i class='fa fa-info-circle'></i> No measurable cost recorded.</div>");
-    return;
-  }
-
-  var html = "<div class='flame-graph'>";
-  html += "<div class='flame-graph-header'><i class='fa fa-fire'></i> Execution Flame Graph</div>";
-  // Root bar spanning full width showing total cost
-  html += "<div class='flame-bar flame-depth-0' style='width:100%'";
-  html += " data-flame-tip='Total execution &mdash; " + escapeHtml(formatCostNanos(totalCost)) + "'>";
-  html += "<span class='flame-label'>Total <small>" + formatCostNanos(totalCost) + "</small></span>";
-  html += "</div>";
-  // Render top-level steps as children, all relative to totalCost
-  html += renderFlameRow(steps, totalCost, 1);
-  html += "</div>";
   container.html(html);
   initFlameTooltips();
+}
+
+/**
+ * Renders a stacked horizontal bar showing how total request time is split
+ * across deserialization (payload parsing), engine execution and
+ * serialization (wire-format conversion). Values come from the server-side
+ * QueryProfile and reflect wall-clock nanoseconds per phase.
+ */
+function renderProfileBreakdown(profile) {
+  var deser = profile.deserializationNanos != null ? profile.deserializationNanos : 0;
+  var engine = profile.engineNanos != null ? profile.engineNanos : 0;
+  var ser = profile.serializationNanos != null ? profile.serializationNanos : 0;
+  var total = profile.totalNanos != null ? profile.totalNanos : (deser + engine + ser);
+  if (total <= 0) return "";
+
+  var phases = [
+    { name: "Deserialization", nanos: deser, cls: "profile-seg-deser" },
+    { name: "Engine",          nanos: engine, cls: "profile-seg-engine" },
+    { name: "Serialization",   nanos: ser,   cls: "profile-seg-ser" }
+  ];
+
+  var html = "<div class='flame-graph profile-breakdown'>";
+  html += "<div class='flame-graph-header'><i class='fa fa-stopwatch'></i> Query Profile &mdash; Total " + formatCostNanos(total) + "</div>";
+  html += "<div class='profile-bar'>";
+  for (var i = 0; i < phases.length; i++) {
+    var p = phases[i];
+    var pct = p.nanos > 0 ? (p.nanos / total * 100) : 0;
+    if (pct <= 0) continue;
+    var widthPct = Math.max(pct, 2);
+    var tip = escapeHtml(p.name) + " &mdash; " + escapeHtml(formatCostNanos(p.nanos)) + " (" + pct.toFixed(1) + "%)";
+    html += "<div class='profile-seg " + p.cls + "' style='width:" + widthPct + "%'";
+    html += " data-flame-tip='" + tip.replace(/'/g, "&#39;") + "'>";
+    html += "<span class='flame-label'>" + escapeHtml(p.name) + " <small>" + formatCostNanos(p.nanos) + "</small></span>";
+    html += "</div>";
+  }
+  html += "</div>";
+  html += "<div class='profile-legend'>";
+  for (var j = 0; j < phases.length; j++) {
+    var lp = phases[j];
+    var lpct = lp.nanos > 0 ? (lp.nanos / total * 100) : 0;
+    html += "<span class='profile-legend-item'><span class='profile-legend-swatch " + lp.cls + "'></span>";
+    html += escapeHtml(lp.name) + ": <b>" + formatCostNanos(lp.nanos) + "</b> <small>(" + lpct.toFixed(1) + "%)</small></span>";
+  }
+  html += "</div>";
+  html += "</div>";
+  return html;
 }
 
 /**
@@ -4931,7 +4973,7 @@ function initFlameTooltips() {
     $("body").append("<div id='flameTooltip' class='flame-tooltip'></div>");
     tip = $("#flameTooltip");
   }
-  $(".flame-bar[data-flame-tip]").on("mouseenter", function(e) {
+  $("[data-flame-tip]").on("mouseenter", function(e) {
     tip.html($(this).attr("data-flame-tip")).css({
       left: e.pageX + 12,
       top: e.pageY - 10
