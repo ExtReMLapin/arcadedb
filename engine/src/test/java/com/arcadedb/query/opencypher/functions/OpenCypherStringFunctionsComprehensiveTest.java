@@ -442,7 +442,6 @@ class OpenCypherStringFunctionsComprehensiveTest {
   }
 
   @Test
-
   void splitTrailingDelimiter() {
     final ResultSet result = database.command("opencypher", "RETURN split('a,b,', ',') AS result");
     Assertions.assertThat(result.hasNext() != false).isTrue();
