@@ -93,7 +93,6 @@ public final class VectorUtils {
     if (vectorObj instanceof String s) {
       final String trimmed = s.trim();
       final String inner = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.substring(1, trimmed.length() - 1) : trimmed;
-
       if (inner.isEmpty())
         return new float[0];
       final String[] parts = inner.split(",");
