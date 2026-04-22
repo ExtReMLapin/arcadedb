@@ -548,8 +548,8 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         if (outStr == null || inStr == null)
           throw new IllegalArgumentException("Edge requires 'out' and 'in' RIDs");
 
-        final var outEl = db.lookupByRID(new RID(db, outStr), false);
-        final var inEl = db.lookupByRID(new RID(db, inStr), false);
+        final var outEl = db.lookupByRID(new RID(outStr), false);
+        final var inEl = db.lookupByRID(new RID(inStr), false);
         final Vertex outV = outEl.asVertex(false);
 
         final MutableEdge e = outV.newEdge(cls, inEl);
@@ -591,7 +591,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
       if (ridStr == null || ridStr.isBlank())
         throw new IllegalArgumentException("rid is required");
 
-      var el = db.lookupByRID(new RID(db, ridStr), true);
+      var el = db.lookupByRID(new RID(ridStr), true);
 
       resp.onNext(LookupByRidResponse.newBuilder().setFound(true).setRecord(convertToGrpcRecord(el.getRecord(), db)).build());
       resp.onCompleted();
@@ -663,9 +663,8 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         beganHere = true;
       }
 
-      // Lookup the record by RID (use database-aware constructor so the returned
-      // record's RID carries the database reference needed by modify()/getPageId())
-      var el = db.lookupByRID(new RID(db, ridStr), true);
+      // Lookup the record by RID. BaseRecord upgrades the stored identity to a DatabaseRID at construction, so modify()/getPageId() stay correct.
+      var el = db.lookupByRID(new RID(ridStr), true);
 
       final var dbRef = db;
 
@@ -809,7 +808,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
     }
 
     try {
-      final var el = db.lookupByRID(new RID(db, ridStr), false);
+      final var el = db.lookupByRID(new RID(ridStr), false);
       el.delete();
 
       if (beganHere) {
@@ -1727,10 +1726,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
           }
         } catch (final Exception e) {
           errorSent[0] = true;
+          // Null batchRef so onCompleted skips processing; skip closeQuietly to avoid blocking the
+          // gRPC thread via async.waitCompletion() (buffered edges have no open transaction).
+          batchRef.set(null);
           resp.onError(Status.INTERNAL.withDescription("graphBatchLoad: " + e.getMessage()).asException());
-          // Note: closeQuietly may flush/commit partial data. GraphBatch has no rollback path by design
-          // (same as the HTTP batch endpoint). Callers should treat batch loading as non-atomic.
-          closeQuietly(batchRef.get());
           return;
         } finally {
           if (!cancelled.get() && !errorSent[0])
@@ -1740,11 +1739,13 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
 
       @Override
       public void onError(final Throwable t) {
-        closeQuietly(batchRef.get());
+        closeQuietly(batchRef.getAndSet(null));
       }
 
       @Override
       public void onCompleted() {
+        if (errorSent[0])
+          return;
         try {
           final GraphBatch batch = batchRef.get();
           if (batch == null) {
@@ -1799,7 +1800,7 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
         throw new IllegalArgumentException("Malformed RID '" + ref + "'");
       final int bucketId = Integer.parseInt(ref.substring(1, colonIdx));
       final long position = Long.parseLong(ref.substring(colonIdx + 1));
-      return new RID(db, bucketId, position);
+      return db.newRID(bucketId, position);
     }
     final RID rid = tempIdMap.get(ref);
     if (rid == null)
@@ -2221,10 +2222,10 @@ public class ArcadeDbGrpcService extends ArcadeDbServiceGrpc.ArcadeDbServiceImpl
             c.errors.add(InsertError.newBuilder().setRowIndex(ctx.received - 1).setCode("MISSING_ENDPOINTS")
                 .setMessage("Edge requires 'out' and 'in'").build());
           } else {
-            var outV = ctx.db.lookupByRID(new RID(ctx.db, outRid), false).asVertex(false);
+            var outV = ctx.db.lookupByRID(new RID(outRid), false).asVertex(false);
 
-            // Create edge from the OUT vertex
-            MutableEdge e = outV.newEdge(ctx.opts.getTargetClass(), new RID(ctx.db, inRid));
+            // Create edge from the OUT vertex. The `in` RID is stored in the edge record; use DatabaseRID so edge.getIn() resolves across threads.
+            MutableEdge e = outV.newEdge(ctx.opts.getTargetClass(), ctx.db.newRID(inRid));
             applyGrpcRecord(e, r); // sets edge properties
             e.save();
             c.inserted++;

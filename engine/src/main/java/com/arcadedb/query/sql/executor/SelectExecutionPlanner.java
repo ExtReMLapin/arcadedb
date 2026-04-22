@@ -68,6 +68,7 @@ import com.arcadedb.query.sql.parser.SchemaIdentifier;
 import com.arcadedb.query.sql.parser.SelectStatement;
 import com.arcadedb.query.sql.parser.SuffixIdentifier;
 import com.arcadedb.query.sql.parser.Statement;
+import com.arcadedb.query.sql.parser.TraverseStatement;
 import com.arcadedb.query.sql.parser.SubQueryCollector;
 import com.arcadedb.query.sql.parser.Timeout;
 import com.arcadedb.query.sql.parser.WhereClause;
@@ -1182,7 +1183,7 @@ public class SelectExecutionPlanner {
         if (variableValue != null) {
           // Handle variable containing a RID string (e.g., '#1:143')
           if (variableValue instanceof String strValue && strValue.startsWith("#")) {
-            final RID rid = new RID(context.getDatabase(), strValue);
+            final RID rid = context.getDatabase().newRID(strValue);
             info.fetchExecutionPlan.chain(new FetchFromRidsStep(List.of(rid), context));
             return;
           }
@@ -1207,7 +1208,7 @@ public class SelectExecutionPlanner {
               else if (item instanceof Result resultItem && resultItem.getIdentity().isPresent())
                 rids.add(resultItem.getIdentity().get());
               else if (item instanceof String strItem && strItem.startsWith("#"))
-                rids.add(new RID(context.getDatabase(), strItem));
+                rids.add(context.getDatabase().newRID(strItem));
             }
             if (!rids.isEmpty()) {
               info.fetchExecutionPlan.chain(new FetchFromRidsStep(rids, context));
@@ -1250,7 +1251,7 @@ public class SelectExecutionPlanner {
       }
       handleBucketsAsTarget(info.fetchExecutionPlan, info, buckets, context);
     } else if (target.getStatement() != null) {
-      handleSubqueryAsTarget(info.fetchExecutionPlan, target.getStatement(), context);
+      handleSubqueryAsTarget(info.fetchExecutionPlan, maybePushWhereIntoTraverse(target.getStatement(), info), context);
     } else if (target.getFunctionCall() != null) {
       //        handleFunctionCallAsTarget(result, target.getFunctionCall(), context);//TODO
       throw new CommandExecutionException("function call as target is not supported yet");
@@ -1388,7 +1389,7 @@ public class SelectExecutionPlanner {
     Object paramValue = inputParam.getValue(context.getInputParameters());
 
     if (paramValue instanceof String string && RID.is(paramValue))
-      paramValue = new RID(context.getDatabase(), string);
+      paramValue = context.getDatabase().newRID(string);
 
     if (paramValue == null) {
       result.chain(new EmptyStep(context));//nothing to return
@@ -1923,7 +1924,7 @@ public class SelectExecutionPlanner {
     // Direct RID literal: #X:Y
     if (expr.getRid() != null) {
       final Rid rid = expr.getRid();
-      return new RID(context.getDatabase(), rid.getBucket().getValue().intValue(), rid.getPosition().getValue().longValue());
+      return context.getDatabase().newRID(rid.getBucket().getValue().intValue(), rid.getPosition().getValue().longValue());
     }
     // Evaluate the expression (handles string parameters like "#215:45086720")
     try {
@@ -1931,7 +1932,7 @@ public class SelectExecutionPlanner {
       if (value instanceof RID rid)
         return rid;
       if (value instanceof String s && s.startsWith("#"))
-        return new RID(context.getDatabase(), s);
+        return context.getDatabase().newRID(s);
     } catch (final Exception e) {
       // Cannot evaluate at plan time
     }
@@ -3458,6 +3459,33 @@ public class SelectExecutionPlanner {
     plan.chain(new SubQueryStep(subExecutionPlan, context, subCtx));
   }
 
+  /**
+   * When the outer SELECT has shape `SELECT ... FROM (TRAVERSE ...) WHERE <row-local cond>`, push the WHERE into the TRAVERSE step as a post-emit filter.
+   * Non-matching vertices still drive expansion (the sub-graph is fully walked), they are just not emitted. This avoids materializing every intermediate vertex
+   * as a Result and running each through a separate FilterStep, which is the dominant cost on the common pattern `... WHERE @type = 'X'` that filters a minority
+   * class out of a multi-type traversal.
+   * <p>
+   * The original TraverseStatement node is not mutated: a copy is returned and the outer WHERE is cleared when consumed.
+   */
+  private Statement maybePushWhereIntoTraverse(final Statement subQuery, final QueryPlanningInfo info) {
+    if (!(subQuery instanceof TraverseStatement traverse))
+      return subQuery;
+    if (info.whereClause == null || info.whereClause.getBaseExpression() == null)
+      return subQuery;
+    // Conservative: skip if WHERE references parent scope, LET variables, or $current/$parent (anything starting with '$').
+    if (info.whereClause.refersToParent())
+      return subQuery;
+    if (info.whereClause.toString().contains("$"))
+      return subQuery;
+
+    final TraverseStatement copy = (TraverseStatement) traverse.copy();
+    copy.setPostFilter(info.whereClause.copy());
+    // WHERE has been consumed by the inner TRAVERSE, so the outer plan must not add another FilterStep for it.
+    info.whereClause = null;
+    info.flattenedWhereClause = null;
+    return copy;
+  }
+
   private boolean isOrderByRidDesc(final QueryPlanningInfo info) {
     if (!hasTargetWithSortedRids(info))
       return false;
@@ -3527,7 +3555,7 @@ public class SelectExecutionPlanner {
         if (value != null) {
           // Handle RID string (e.g., '#1:143') - Issue #2350
           if (value instanceof String strValue && strValue.startsWith("#")) {
-            final RID rid = new RID(db, strValue);
+            final RID rid = db.newRID(strValue);
             if (item.getRids() == null) {
               item.setRids(new ArrayList<>());
             }

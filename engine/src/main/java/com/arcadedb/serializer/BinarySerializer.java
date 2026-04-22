@@ -209,7 +209,7 @@ public class BinarySerializer {
     } catch (Exception e) {
       LogManager.instance().log(this, Level.SEVERE, "Possible corrupted record %s", e, rid);
     }
-    return null;
+    return Collections.emptySet();
   }
 
   public Map<String, Object> deserializeProperties(final Database database, final Binary buffer,
@@ -723,10 +723,10 @@ public class BinarySerializer {
       value = new BigDecimal(new BigInteger(unscaledValue), scale);
       break;
     case BinaryTypes.TYPE_COMPRESSED_RID:
-      value = new RID(database, (int) deserialized.getNumber(), deserialized.getNumber());
+      value = RID.create(database, (int) deserialized.getNumber(), deserialized.getNumber());
       break;
     case BinaryTypes.TYPE_RID:
-      value = new RID(database, deserialized.getInt(), deserialized.getLong());
+      value = RID.create(database, deserialized.getInt(), deserialized.getLong());
       break;
     case BinaryTypes.TYPE_UUID:
       value = new UUID(content.getNumber(), content.getNumber());
