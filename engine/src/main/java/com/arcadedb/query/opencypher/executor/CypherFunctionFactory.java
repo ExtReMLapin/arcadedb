@@ -325,7 +325,6 @@ public class CypherFunctionFactory {
       // Scalar functions
       case "nullif", "valuetype" -> true;
       // Aggregation functions
-
       case "collect", "collect_list", "percentiledisc", "percentile_disc", "percentilecont", "percentile_cont", "min", "max",
            "avg" -> true;
       // Temporal functions
